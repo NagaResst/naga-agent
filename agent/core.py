@@ -12,6 +12,8 @@ from agent.token_tracker import TokenTracker
 from agent.router import ModelRouter
 from agent import summarizer
 from agent.skill_registry import discover_skills
+from agent.context_window import get_context_window
+from memory.manager import MemoryManager
 
 
 class Agent:
@@ -36,6 +38,24 @@ class Agent:
 
         # 注入 session_manager 到 memory 工具
         memory_module.set_session_manager(session_manager)
+
+        # 初始化分层记忆管理器
+        self._memory_manager = None
+        if config.get("memory", {}).get("enabled", False):
+            try:
+                self._memory_manager = MemoryManager(
+                    config["memory"],
+                    config["redis"],
+                    config["api_key"],
+                    config.get("base_url"),
+                )
+                if self._memory_manager.available:
+                    memory_module.set_memory_manager(self._memory_manager)
+                    console.print("[dim]分层记忆已启用（mem0 + 向量库）[/dim]")
+                else:
+                    console.print("[dim yellow]分层记忆初始化失败，降级为 Redis KV 模式[/dim yellow]")
+            except Exception as e:
+                console.print(f"[dim yellow]分层记忆加载异常：{e}，降级为 Redis KV 模式[/dim yellow]")
 
         # 注入 search 配置到 web_search 工具
         web_search_module.set_config(config.get("search", {}))
@@ -69,40 +89,64 @@ class Agent:
         # 构建不含 system prompt 的原始消息列表，用于 token 估算
         raw_messages = [{"role": m["role"], "content": m["content"]} for m in history]
 
-        # 触发历史摘要压缩：纯按 token 数量判断
-        context_limit = self.config["agent"].get("context_token_limit", 28000)
-        estimated_tokens = self._token_tracker.estimate(raw_messages)
-        if summarizer.should_summarize(estimated_tokens, context_limit):
-            classifier_model = self.config.get("routing", {}).get("classifier_model", "qwen-turbo")
-            kept, new_summary = summarizer.compress_history(
-                history, self.max_history, self._client, classifier_model,
-                self._history_summary,
-            )
-            if new_summary != self._history_summary:
-                self._history_summary = new_summary
-                # 持久化摘要到 Redis，重启后可恢复
-                self.session_manager.set_summary(self.session_id, new_summary)
-                self.session_manager.clear_messages(self.session_id)
-                for m in kept:
-                    self.session_manager.append_message(self.session_id, m["role"], m["content"])
-            history = kept
-            raw_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        # 动态获取当前模型的上下文窗口大小
+        context_window = get_context_window(
+            self.model,
+            self.config["agent"].get("context_token_limit", 0),
+        )
+        threshold = self.config["agent"].get("compress_threshold", 0.60)
+        tool_max_chars = self.config["agent"].get("tool_output_max_chars", 300)
 
-        # 每轮动态构建 system prompt：base + 最新记忆 + 历史摘要（不修改 config，避免累积）
+        estimated_tokens = self._token_tracker.estimate(raw_messages)
+        if summarizer.should_compress(estimated_tokens, context_window, threshold):
+            # 触发前先同步 mem0 提取，确保即将被压缩的内容已落入记忆
+            if self._memory_manager and self._memory_manager.available:
+                self._memory_manager.add(raw_messages, layer="episodic")
+            # 纯机械压缩，只在内存中生效，不写入 Redis
+            raw_messages = summarizer.compress_pipeline(
+                raw_messages,
+                self._token_tracker,
+                context_window,
+                threshold,
+                tool_max_chars,
+            )
+
+        # 每轮动态构建 system prompt：base + 记忆层 + 历史摘要（不修改 config，避免累积）
         base_prompt = self.config["agent"].get("system_prompt", "").strip()
-        memories = self.session_manager.list_memories()
-        if memories:
-            lines = [f"  {k}: {v}" for k, v in memories.items()]
-            memory_block = "\n\n【用户记忆】\n" + "\n".join(lines)
+
+        # 会话意图锚：取第一条 user 消息作为锁定开始点
+        first_user = next(
+            (m["content"] for m in (self.session_manager.get_history(self.session_id) or [])
+             if m.get("role") == "user"), ""
+        )
+        if first_user:
+            anchor = first_user[:100] + ("..." if len(first_user) > 100 else "")
+            base_prompt += f"\n\n【本次会话起点】\n{anchor}"
+
+        # Layer1 核心记忆
+        if self._memory_manager and self._memory_manager.available:
+            core_items = self._memory_manager.search_core()
+            memory_block = ("\n\n【用户记忆】\n" + "\n".join(f"  {m}" for m in core_items)) if core_items else ""
         else:
-            memory_block = ""
-        if self._history_summary:
-            summary_block = f"\n\n【早期对话摘要】\n{self._history_summary}"
-        else:
-            summary_block = ""
+            memories = self.session_manager.list_memories()
+            memory_block = ("\n\n【用户记忆】\n" + "\n".join(f"  {k}: {v}" for k, v in memories.items())) if memories else ""
+
+        # Layer2 情节记忆（语义检索，取最后一条用户消息作为 query）
+        episodic_block = ""
+        if self._memory_manager and self._memory_manager.available:
+            last_user = next((m["content"] for m in reversed(raw_messages) if m.get("role") == "user"), "")
+            if last_user:
+                top_k = self.config.get("memory", {}).get("episodic_top_k", 3)
+                episodic_items = self._memory_manager.search_episodic(last_user, top_k=top_k)
+                if episodic_items:
+                    episodic_block = "\n\n【相关记忆】\n" + "\n".join(f"  {m}" for m in episodic_items)
+
+        # Layer3：只读旧摘要，不再写入
+        summary_block = f"\n\n【早期对话摘要】\n{self._history_summary}" if self._history_summary else ""
+
         # 激活的 skill prompt 追加在最末尾
         skill_block = "\n\n".join(s["prompt"] for s in self._skills if s["enabled"])
-        system_prompt = base_prompt + memory_block + summary_block
+        system_prompt = base_prompt + memory_block + episodic_block + summary_block
         if skill_block:
             system_prompt += "\n\n" + skill_block
         if system_prompt.strip():
@@ -321,6 +365,13 @@ class Agent:
                         self.session_manager, self.session_id, active_model,
                         {"prompt_tokens": _acc_input, "completion_tokens": _acc_output},
                     )
+                # 触发异步情节记忆提取
+                if self._memory_manager and self._memory_manager.available:
+                    history = self.session_manager.get_history(self.session_id)
+                    turn_count = len(history)
+                    if self._memory_manager.should_extract(turn_count, full_content):
+                        recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+                        self._memory_manager.extract_async(recent)
                 return full_content
 
         return full_content

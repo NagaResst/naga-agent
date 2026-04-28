@@ -75,6 +75,14 @@ def load_config() -> dict:
 
     skills_section = toml_config.get("skills", {})
 
+    memory_section = toml_config.get("memory", {})
+    # embedder base_url 为空时继承顶层 base_url
+    embedder_cfg = dict(memory_section.get("embedder", {}))
+    if not embedder_cfg.get("base_url"):
+        embedder_cfg["base_url"] = base_url or ""
+    memory_section = dict(memory_section)
+    memory_section["embedder"] = embedder_cfg
+
     return {
         "api_key": api_key,
         "base_url": base_url,
@@ -114,7 +122,9 @@ def load_config() -> dict:
             "enable_search": False,  # 锁死：独立计费禁止使用 DashScope 自带联网搜索
             "prompt_prefix": os.environ.get("AGENT_PROMPT_PREFIX", agent_section.get("prompt_prefix", "🤖")),
             "system_prompt": system_prompt,
-            "context_token_limit": agent_section.get("context_token_limit", 28000),
+            "context_token_limit": agent_section.get("context_token_limit", 0),
+            "compress_threshold": agent_section.get("compress_threshold", 0.60),
+            "tool_output_max_chars": agent_section.get("tool_output_max_chars", 300),
         },
         "search": {
             "api_key": bocha_api_key,
@@ -125,4 +135,5 @@ def load_config() -> dict:
         "skills": {
             "enabled": skills_section.get("enabled", []),
         },
+        "memory": memory_section,
     }

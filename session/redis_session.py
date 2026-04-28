@@ -23,16 +23,16 @@ class SessionManager:
             )
 
     def _meta_key(self, session_id: str) -> str:
-        return f"qwen_agent:session:{session_id}:meta"
+        return f"naga_agent:session:{session_id}:meta"
 
     def _messages_key(self, session_id: str) -> str:
-        return f"qwen_agent:session:{session_id}:messages"
+        return f"naga_agent:session:{session_id}:messages"
 
     def list_sessions(self) -> list:
         sessions = []
         cursor = 0
         while True:
-            cursor, keys = self._client.scan(cursor, match="qwen_agent:session:*:meta", count=100)
+            cursor, keys = self._client.scan(cursor, match="naga_agent:session:*:meta", count=100)
             for key in keys:
                 meta = self._client.hgetall(key)
                 session_id = meta.get("id", "")
@@ -85,7 +85,7 @@ class SessionManager:
     # ── Token 用量 ──────────────────────────────────────────────────────────
 
     def _token_usage_key(self, session_id: str) -> str:
-        return f"qwen_agent:session:{session_id}:token_usage"
+        return f"naga_agent:session:{session_id}:token_usage"
 
     def append_token_usage(self, session_id: str, record: dict):
         import json as _json
@@ -105,7 +105,7 @@ class SessionManager:
     # ── 跨会话记忆 ──────────────────────────────────────────────────────────
 
     def _memory_key(self, key: str) -> str:
-        return f"qwen_agent:memory:{key}"
+        return f"naga_agent:memory:{key}"
 
     def set_memory(self, key: str, value: str):
         self._client.set(self._memory_key(key), value)
@@ -117,9 +117,9 @@ class SessionManager:
         result = {}
         cursor = 0
         while True:
-            cursor, keys = self._client.scan(cursor, match="qwen_agent:memory:*", count=100)
+            cursor, keys = self._client.scan(cursor, match="naga_agent:memory:*", count=100)
             for k in keys:
-                short_key = k[len("qwen_agent:memory:"):]
+                short_key = k[len("naga_agent:memory:"):]
                 result[short_key] = self._client.get(k) or ""
             if cursor == 0:
                 break
@@ -137,7 +137,7 @@ class SessionManager:
     # ── 会话历史摘要（持久化压缩摘要）──────────────────────────────────
 
     def _summary_key(self, session_id: str) -> str:
-        return f"qwen_agent:session:{session_id}:summary"
+        return f"naga_agent:session:{session_id}:summary"
 
     def get_summary(self, session_id: str) -> str:
         return self._client.get(self._summary_key(session_id)) or ""

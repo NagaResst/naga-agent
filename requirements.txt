@@ -8,3 +8,7 @@ tiktoken>=0.7.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+# 分层记忆系统
+mem0ai>=0.1.0
+chromadb>=0.5.0         # 默认向量后端（内嵌，无需独立服务）
+# qdrant-client>=1.9.0  # 可选：使用 Qdrant 后端时安装

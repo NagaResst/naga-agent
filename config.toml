@@ -68,7 +68,9 @@ show_thinking = true
 enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
 prompt_prefix = "雯雯在听"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
-context_token_limit = 28000  # 上下文窗口 token 上限，超过 75% 时触发历史摘要压缩
+context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
+compress_threshold = 0.60         # 超过上下文窗口的 60% 时触发压缩管线
+tool_output_max_chars = 300       # 旧轮次工具输出最大保留字符数
 
 [search]
 max_results = 8        # 单次搜索返回最大条数
@@ -79,3 +81,45 @@ freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
 # 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）
 # 空列表时，由各文件自身 frontmatter 中的 enabled 字段决定
 enabled = []
+
+# ── 记忆系统配置 ────────────────────────────────────────────────────────────
+[memory]
+enabled = true
+# 向量库后端：chroma（默认，内嵌）/ qdrant / redis
+backend = "chroma"
+# 每 N 轮对话后触发一次记忆提取；0 = 仅会话结束时触发
+extract_every_n_turns = 3
+# 触发提取的最小内容字符数（避免短消息浪费）
+min_content_length = 20
+# Layer2 情节记忆语义检索返回条数
+episodic_top_k = 3
+# Layer1 核心记忆全量注入 system prompt 的最大条数
+core_max_items = 20
+
+[memory.embedder]
+# 嵌入模型供应商：openai / ollama
+provider = "openai"
+model = "text-embedding-3-small"
+# 留空则继承 [model].base_url
+base_url = ""
+
+# Chroma 配置（内嵌或独立部署二选一）
+[memory.chroma]
+# mode: local（内嵌，无需独立服务）/ server（独立部署）
+mode = "local"
+path = "./chroma_db"   # mode=local 时有效
+host = "localhost"     # mode=server 时有效
+port = 8000
+
+# Qdrant 配置（内嵌或独立部署二选一）
+[memory.qdrant]
+# mode: local（内嵌文件）/ server（独立部署）
+mode = "local"
+path = "./qdrant_db"   # mode=local 时有效
+host = "localhost"     # mode=server 时有效
+port = 6333
+
+# Redis 向量索引配置（复用 [redis] 连接，需 RedisStack / Redis 7.2+）
+[memory.redis_vector]
+index_name = "naga_memories"
+vector_dim = 1536
