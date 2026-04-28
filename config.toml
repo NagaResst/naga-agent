@@ -58,6 +58,8 @@ command_timeout = 30       # execute_command 超时秒数
 output_max_chars = 3000    # 工具返回结果最大字符数
 tool_max_rounds = 30       # 单次对话最大工具调用轮次（防死循环）
 tool_max_errors = 3        # 连续工具错误上限（防错误风暴）
+replan_threshold = 0.6     # 信号B：step 轮次消耗比超此值触发 re-planner
+replan_repeat_window = 3   # 信号C：重复检测滑动窗口大小
 
 [agent]
 max_history = 50
@@ -74,7 +76,7 @@ compress_threshold = 0.60         # 超过上下文窗口的 60% 时触发压缩
 tool_output_max_chars = 300       # 旧轮次工具输出最大保留字符数
 
 [search]
-max_results = 8        # 单次搜索返回最大条数
+max_results = 10        # 单次搜索返回最大条数
 timeout = 10           # 请求超时秒数
 freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
 

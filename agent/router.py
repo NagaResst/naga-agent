@@ -1,5 +1,6 @@
 import re
 import hashlib
+from typing import Optional, Tuple
 
 # 触发 complex/high 路由的关键词
 # 只保留「动作意图」明确的词，避免「架构/设计/分析」等单独出现时的假阳性
@@ -73,26 +74,26 @@ class ModelRouter:
         ascii_words = len(re.findall(r'[a-zA-Z0-9]+', text))
         return max(1, int(cjk_count * 1.5 + ascii_words * 0.3 + (len(text) - cjk_count - ascii_words) * 0.4))
 
-    def _rule_route(self, user_input: str, history_len: int, agent_cfg: dict) -> str | None:
-        """规则层路由，返回模型名或 None（表示需要分类层）。"""
+    def _rule_route(self, user_input: str, history_len: int, agent_cfg: dict) -> Optional[Tuple[str, str]]:
+        """规则层路由，返回 (model, label) 或 None（表示需要分类层）。"""
         text = user_input.strip()
         token_estimate = self._estimate_tokens(text)
 
         # 超长输入必然是 complex，跳过分类器节省 API 调用
         if token_estimate > 400:
-            return self.get_model_by_tier(self._model_map.get("complex", "high"))
+            return self.get_model_by_tier(self._model_map.get("complex", "high")), "complex"
 
         # 明显简单
         if token_estimate < 30 and _SIMPLE_KEYWORDS.match(text):
-            return self.get_model_by_tier(self._model_map.get("simple", "low"))
+            return self.get_model_by_tier(self._model_map.get("simple", "low")), "simple"
 
         # 动作意图明确的复杂请求
         if _COMPLEX_KEYWORDS.search(text):
-            return self.get_model_by_tier(self._model_map.get("complex", "high"))
+            return self.get_model_by_tier(self._model_map.get("complex", "high")), "complex"
 
         # 长对话上下文 → 偏向 medium
         if history_len > 20:
-            return self.get_model_by_tier(self._model_map.get("medium", "medium"))
+            return self.get_model_by_tier(self._model_map.get("medium", "medium")), "medium"
 
         return None  # 交给分类层
 
@@ -149,23 +150,29 @@ class ModelRouter:
         history_len: int,
         agent_cfg: dict,
         client,
-        manual_model: str | None = None,
-    ) -> tuple[str, str]:
-        """完整路由，返回 (model_name, reason)。
+        manual_model: Optional[str] = None,
+    ) -> Tuple[str, str, str]:
+        """完整路由，返回 (model_name, reason, complexity)。
 
+        complexity: simple / medium / complex，供 plan_node 判断是否触发规划。
         manual_model: 用户通过 /model 手动指定的模型，非空时直接返回，跳过路由。
         """
         if not self._cfg.get("enabled", False):
-            return manual_model or self.get_model_by_tier("medium"), "routing_disabled"
+            return manual_model or self.get_model_by_tier("medium"), "routing_disabled", "simple"
 
         if manual_model:
-            return manual_model, "manual"
+            return manual_model, "manual", "simple"
 
         # 第一层：规则
         rule_result = self._rule_route(user_input, history_len, agent_cfg)
         if rule_result:
-            return rule_result, "rule"
+            model, label = rule_result
+            return model, "rule", label
 
         # 第二层：分类模型（带 Redis 缓存）
         model, reason = self._cached_classify(user_input, client)
-        return model, reason
+        # reason 格式："classifier:complex" / "classifier:complex(cached)"
+        label = reason.split(":", 1)[-1].split("(")[0].strip()
+        if label not in ("simple", "medium", "complex"):
+            label = "medium"
+        return model, reason, label

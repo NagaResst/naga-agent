@@ -111,6 +111,10 @@ def load_config() -> dict:
             "command_timeout": tools_section.get("command_timeout", 30),
             "output_max_chars": tools_section.get("output_max_chars", 3000),
             "tool_max_retries": tools_section.get("tool_max_retries", 2),
+            "tool_max_rounds": tools_section.get("tool_max_rounds", 10),
+            "tool_max_errors": tools_section.get("tool_max_errors", 3),
+            "replan_threshold": tools_section.get("replan_threshold", 0.6),
+            "replan_repeat_window": tools_section.get("replan_repeat_window", 3),
         },
         "agent": {
             "max_history": agent_section.get("max_history", 50),

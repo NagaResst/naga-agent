@@ -224,6 +224,107 @@ class Agent:
         extra = dict(self.config["model"].get("extra_params", {}).get(model, {}))
         return extra if extra else None
 
+    _PLAN_SYSTEM = (
+        "你是一个任务规划器。根据用户的任务，输出一个严格按照以下格式的执行计划，"
+        "不要有任何额外解释、不要执行任何操作、不要输出代码：\n\n"
+        "[ ] Step 1: <具体步骤描述>\n"
+        "[ ] Step 2: <具体步骤描述>\n"
+        "...\n\n"
+        "要求：\n"
+        "- 每个步骤必须是可独立执行的最小工作单元\n"
+        "- 步骤数量 3~8 个，不要过于拆碎也不要合并复杂操作\n"
+        "- 只输出步骤列表，不要有前言和总结"
+    )
+
+    def _plan_node(self, user_input: str, messages: list, model: str):
+        """规划节点：生成 checkbox 步骤列表并展示，返回 (steps, plan_text)。"""
+        import re as _re
+        from rich.panel import Panel as RichPanel
+
+        plan_messages = [
+            {"role": "system", "content": self._PLAN_SYSTEM},
+            {"role": "user", "content": user_input},
+        ]
+        try:
+            resp = self._client.chat.completions.create(
+                model=model,
+                messages=plan_messages,
+                temperature=0.3,
+                stream=False,
+            )
+            plan_text = resp.choices[0].message.content.strip()
+        except Exception as e:
+            plan_text = f"[ ] Step 1: 完成用户任务：{user_input}"
+            self.console.print(f"[dim yellow]规划阶段异常（{e}），使用默认单步计划[/dim yellow]")
+
+        self.console.print(RichPanel(
+            plan_text,
+            title="[bold cyan]执行计划[/bold cyan]",
+            border_style="cyan",
+            padding=(0, 1),
+        ))
+
+        # 解析步骤列表：匹配 "[ ] Step N: ..." 格式
+        steps = _re.findall(r'\[ \]\s*Step\s*\d+:\s*(.+)', plan_text)
+        if not steps:
+            steps = [line.strip() for line in plan_text.splitlines() if line.strip()]
+        return steps, plan_text
+
+    _REPLAN_SYSTEM = (
+        "你是一个任务监控器。根据当前步骤描述和最近工具调用情况，"
+        "判断执行状态并只输出以下三个词之一，不要有任何其他内容：\n"
+        "continue\n"
+        "skip\n"
+        "abort\n\n"
+        "判断标准：\n"
+        "- continue：遇到短暂障碍但方向正确，重置计数器继续当前步骤\n"
+        "- skip：当前步骤无法完成，跳过进入下一步骤\n"
+        "- abort：整个任务无法继续执行"
+    )
+
+    def _replan_node(self, step_desc: str, recent_tool_summary: str, low_model: str) -> str:
+        """Re-planner：走低价模型，返回 continue / skip / abort。"""
+        try:
+            resp = self._client.chat.completions.create(
+                model=low_model,
+                messages=[
+                    {"role": "system", "content": self._REPLAN_SYSTEM},
+                    {"role": "user", "content": f"当前步骤：{step_desc}\n\n最近工具调用摘要：\n{recent_tool_summary}"},
+                ],
+                temperature=0.0,
+                max_tokens=10,
+                stream=False,
+            )
+            decision = resp.choices[0].message.content.strip().lower()
+        except Exception:
+            decision = "continue"
+
+        if decision not in ("continue", "skip", "abort"):
+            decision = "continue"
+        return decision
+
+    @staticmethod
+    def _should_replan(
+        step_round: int,
+        tool_max_rounds: int,
+        tool_error_count: int,
+        tool_max_errors: int,
+        recent_hashes: list,
+        repeat_window: int,
+        replan_threshold: float,
+    ):
+        """算法四：三信号 OR 触发，返回 (bool, reason)。"""
+        # 信号A：连续错误达上限
+        if tool_error_count >= tool_max_errors:
+            return True, f"连续错误达上限（{tool_max_errors}）"
+        # 信号B：轮次消耗比超阈值
+        if tool_max_rounds > 0 and step_round / tool_max_rounds > replan_threshold:
+            return True, f"轮次消耗比 {step_round}/{tool_max_rounds} 超过 {replan_threshold}"
+        # 信号C：工具输出重复（滑动窗口内出现相同哈希）
+        if len(recent_hashes) >= repeat_window and len(set(recent_hashes[-repeat_window:])) == 1:
+            return True, "工具输出重复检测"
+        return False, ""
+
     def chat(self, user_input: str) -> str:
         self.session_manager.append_message(self.session_id, "user", user_input)
         messages = self._get_messages()
@@ -234,7 +335,7 @@ class Agent:
 
         # 模型路由
         history_len = len(self.session_manager.get_history(self.session_id))
-        routed_model, route_reason = self._router.route(
+        routed_model, route_reason, complexity = self._router.route(
             user_input, history_len, agent_cfg, self._client,
             manual_model=self._manual_model if self._routing_locked else None,
         )
@@ -246,105 +347,120 @@ class Agent:
         if self.config.get("routing", {}).get("show_routing_decision", True) and route_reason != "manual":
             self.console.print(f"[dim]路由决策：{active_model}  ({route_reason})  预估输入 ~{estimated_input} tokens[/dim]")
 
-        tool_round_count = 0
-        tool_error_count = 0
+        # 规划节点：medium / complex 任务先生成执行计划
+        if complexity in ("medium", "complex"):
+            steps, plan_text = self._plan_node(user_input, messages, active_model)
+            messages.append({
+                "role": "system",
+                "content": f"【执行计划】\n{plan_text}\n\n请严格按照上述步骤顺序完成任务。",
+            })
+        else:
+            steps = []
+
+        # re-planner 所需配置
+        replan_threshold = tools_cfg.get("replan_threshold", 0.6)
+        replan_repeat_window = tools_cfg.get("replan_repeat_window", 3)
+        low_model = self.config["model"].get("tier_to_model", {}).get("low") or active_model
+
         # 累加所有轮次工具调用的 token，避免中间轮消耗丢失
         _acc_input = 0
         _acc_output = 0
+        _task_aborted = False
 
-        while True:
-            kwargs = dict(
-                model=active_model,
-                messages=messages,
-                tools=self.tool_definitions if self.tool_definitions else None,
-                stream=True,
-                temperature=agent_cfg.get("temperature", 0.7),
-                top_p=agent_cfg.get("top_p", 0.8),
-                stream_options={"include_usage": True},
-            )
-            extra_body = self._build_extra_body(active_model)
-            if extra_body:
-                kwargs["extra_body"] = extra_body
+        def _run_tool_loop(step_desc: str = ""):
+            """单个 step（或无 plan 模式）的工具调用循环。
+            返回 (full_content, loop_break_reason)，loop_break_reason: 'done'/'abort'
+            """
+            nonlocal _acc_input, _acc_output, _task_aborted
 
-            stream = self._client.chat.completions.create(**kwargs)
+            step_round_count = 0
+            step_error_count = 0
+            recent_hashes: list = []
+            from collections import deque as _deque
+            recent_tool_lines: _deque = _deque(maxlen=replan_repeat_window)
 
-            full_content = ""
-            tool_calls_acc = []
-            finish_reason = None
-            in_reasoning = False
+            while True:
+                kwargs = dict(
+                    model=active_model,
+                    messages=messages,
+                    tools=self.tool_definitions if self.tool_definitions else None,
+                    stream=True,
+                    temperature=agent_cfg.get("temperature", 0.7),
+                    top_p=agent_cfg.get("top_p", 0.8),
+                    stream_options={"include_usage": True},
+                )
+                extra_body = self._build_extra_body(active_model)
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
 
-            for chunk in stream:
-                # 累加每轮的 token 消耗
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    _acc_input += getattr(chunk.usage, "prompt_tokens", 0) or 0
-                    _acc_output += getattr(chunk.usage, "completion_tokens", 0) or 0
+                stream = self._client.chat.completions.create(**kwargs)
 
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                finish_reason = chunk.choices[0].finish_reason or finish_reason
+                full_content = ""
+                tool_calls_acc = []
+                finish_reason = None
+                in_reasoning = False
 
-                # 思维链内容（qwen3 系列）
-                rc = getattr(delta, "reasoning_content", None)
-                if rc:
-                    if not in_reasoning:
+                for chunk in stream:
+                    if hasattr(chunk, "usage") and chunk.usage is not None:
+                        _acc_input += getattr(chunk.usage, "prompt_tokens", 0) or 0
+                        _acc_output += getattr(chunk.usage, "completion_tokens", 0) or 0
+
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    finish_reason = chunk.choices[0].finish_reason or finish_reason
+
+                    rc = getattr(delta, "reasoning_content", None)
+                    if rc:
+                        if not in_reasoning:
+                            if self.config["agent"].get("show_thinking", True):
+                                self.console.print("\n[dim italic]思考中...[/dim italic]")
+                            in_reasoning = True
                         if self.config["agent"].get("show_thinking", True):
-                            self.console.print("\n[dim italic]思考中...[/dim italic]")
-                        in_reasoning = True
-                    if self.config["agent"].get("show_thinking", True):
-                        self.console.print(f"[dim]{rc}[/dim]", end="")
+                            self.console.print(f"[dim]{rc}[/dim]", end="")
 
-                # 正常回复内容（流式打印）
-                if delta.content:
-                    if in_reasoning:
-                        self.console.print()  # 结束思维链换行
-                        in_reasoning = False
-                    self.console.print(delta.content, end="", markup=False, highlight=False)
-                    full_content += delta.content
+                    if delta.content:
+                        if in_reasoning:
+                            self.console.print()
+                            in_reasoning = False
+                        self.console.print(delta.content, end="", markup=False, highlight=False)
+                        full_content += delta.content
 
-                # 累积 tool_calls 分片
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        while len(tool_calls_acc) <= idx:
-                            tool_calls_acc.append({
-                                "id": "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            })
-                        if tc_delta.id:
-                            tool_calls_acc[idx]["id"] = tc_delta.id
-                        if tc_delta.function and tc_delta.function.name:
-                            tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
-                        if tc_delta.function and tc_delta.function.arguments:
-                            tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            while len(tool_calls_acc) <= idx:
+                                tool_calls_acc.append({
+                                    "id": "", "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                })
+                            if tc_delta.id:
+                                tool_calls_acc[idx]["id"] = tc_delta.id
+                            if tc_delta.function and tc_delta.function.name:
+                                tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
+                            if tc_delta.function and tc_delta.function.arguments:
+                                tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
 
-            if full_content or in_reasoning:
-                self.console.print()  # 流式结束后换行
+                if full_content or in_reasoning:
+                    self.console.print()
 
-            if finish_reason == "tool_calls":
-                # 轮次上限检查（防死循环）
-                if tool_round_count >= tool_max_rounds:
-                    self.console.print(
-                        f"[bold red]工具调用已达最大轮次（{tool_max_rounds}），停止执行。[/bold red]"
-                    )
-                    self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content) or "[TOOL_LIMIT]")
-                    break
+                # 模型主动停止 or [STEP_DONE] 信号 → 当前 step 完成
+                if finish_reason != "tool_calls" or "[STEP_DONE]" in full_content:
+                    return full_content, "done"
 
-                tool_round_count += 1
+                # 轮次上限硬停（兜底，正常应由 re-planner 提前处理）
+                if step_round_count >= tool_max_rounds:
+                    self.console.print(f"[bold red]工具调用已达最大轮次（{tool_max_rounds}），强制停止。[/bold red]")
+                    return full_content, "done"
+
+                step_round_count += 1
 
                 messages.append({
                     "role": "assistant",
                     "content": full_content or None,
                     "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
+                        {"id": tc["id"], "type": "function",
+                         "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}
                         for tc in tool_calls_acc
                     ],
                 })
@@ -381,11 +497,16 @@ class Agent:
 
                     tool_result = self._call_tool(tool_name, tool_args)
 
-                    # 连续错误计数
                     if tool_result.startswith("错误："):
-                        tool_error_count += 1
+                        step_error_count += 1
                     else:
-                        tool_error_count = 0
+                        step_error_count = 0
+
+                    # 信号C：记录工具调用哈希
+                    import hashlib as _hl
+                    call_hash = _hl.md5(f"{tool_name}:{tool_result[:200]}".encode()).hexdigest()
+                    recent_hashes.append(call_hash)
+                    recent_tool_lines.append(f"  {tool_name}: {tool_result[:100]}")
 
                     messages.append({
                         "role": "tool",
@@ -394,31 +515,63 @@ class Agent:
                         "content": tool_result,
                     })
 
-                # 连续错误上限检查（防错误风暴）
-                if tool_error_count >= tool_max_errors:
-                    self.console.print(
-                        f"[bold red]工具连续错误已达上限（{tool_max_errors}），停止执行。[/bold red]"
-                    )
-                    self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content) or "[TOOL_ERROR]")
-                    break
-            else:
-                self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content))
-                # 记录所有轮次累积的真实 token 消耗（含中间工具调用轮次）
-                if _acc_input or _acc_output:
-                    self._token_tracker.record_usage(
-                        self.session_manager, self.session_id, active_model,
-                        {"prompt_tokens": _acc_input, "completion_tokens": _acc_output},
-                    )
-                # 触发异步情节记忆提取
-                if self._memory_manager and self._memory_manager.available:
-                    history = self.session_manager.get_history(self.session_id)
-                    turn_count = len(history)
-                    if self._memory_manager.should_extract(turn_count, full_content):
-                        recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
-                        self._memory_manager.extract_async(recent)
-                return full_content
+                # 算法四：三信号检测
+                triggered, reason = self._should_replan(
+                    step_round_count, tool_max_rounds,
+                    step_error_count, tool_max_errors,
+                    recent_hashes, replan_repeat_window, replan_threshold,
+                )
+                if triggered and step_desc:
+                    self.console.print(f"[dim yellow]Re-planner 触发（{reason}）[/dim yellow]")
+                    recent_summary = "\n".join(recent_tool_lines[-replan_repeat_window:])
+                    decision = self._replan_node(step_desc, recent_summary, low_model)
+                    self.console.print(f"[dim]Re-planner 决策：{decision}[/dim]")
+                    if decision == "skip":
+                        return full_content, "done"
+                    elif decision == "abort":
+                        _task_aborted = True
+                        return full_content, "abort"
+                    else:  # continue：重置计数器
+                        step_round_count = 0
+                        step_error_count = 0
+                        recent_hashes.clear()
 
-        return full_content
+            # unreachable
+            return "", "done"
+
+        # ── 主执行逻辑 ──────────────────────────────────────────────
+        last_content = ""
+        if steps:
+            # plan 模式：逐 step 执行
+            for i, step_desc in enumerate(steps, 1):
+                self.console.print(f"\n[bold cyan]► Step {i}/{len(steps)}：[/bold cyan]{step_desc}")
+                messages.append({
+                    "role": "system",
+                    "content": f"【当前步骤 {i}/{len(steps)}】{step_desc}",
+                })
+                last_content, reason = _run_tool_loop(step_desc)
+                self.console.print(f"[dim green]✓ Step {i} 完成[/dim green]")
+                if _task_aborted:
+                    self.console.print("[bold red]任务已中止。[/bold red]")
+                    break
+        else:
+            # simple 模式：单层循环（无 step 分割，step_desc 为空，re-planner 不介入）
+            last_content, _ = _run_tool_loop("")
+
+        # 记录 session + token + 记忆
+        self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(last_content))
+        if _acc_input or _acc_output:
+            self._token_tracker.record_usage(
+                self.session_manager, self.session_id, active_model,
+                {"prompt_tokens": _acc_input, "completion_tokens": _acc_output},
+            )
+        if self._memory_manager and self._memory_manager.available:
+            history = self.session_manager.get_history(self.session_id)
+            turn_count = len(history)
+            if self._memory_manager.should_extract(turn_count, last_content):
+                recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+                self._memory_manager.extract_async(recent)
+        return last_content
 
     def get_token_summary(self) -> dict:
         return self._token_tracker.get_session_summary(
