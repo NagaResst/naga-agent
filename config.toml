@@ -1,0 +1,81 @@
+[redis]
+host = "localhost"
+port = 6379
+db = 0
+password = ""
+
+[model]
+default = "qwen3.6-flash"
+available = ["qwen3.6-flash","qwen3.6-flash-2026-04-16", "qwen3.6-plus", "qwen3.6-max-preview"]
+base_url = ""  # 留空使用 OpenAI 官方地址，填入第三方兼容服务 URL，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# 费用等级标记：low / medium / high
+# 同一 tier 有多个模型时，available 列表中靠后的优先
+[model.tiers]
+"qwen3.6-flash"            = "low"
+"qwen3.6-flash-2026-04-16" = "low"
+"qwen3.6-plus"             = "medium"
+"qwen3.6-max-preview"      = "high"
+
+# 模型专属扩展参数，注入 API 请求的 extra_body（仅部分供应商支持）
+# 示例：为 Qwen3 系列配置思维链参数
+[model.extra_params."qwen3.6-flash"]
+enable_thinking = true
+thinking_budget = 4000
+
+[model.extra_params."qwen3.6-flash-2026-04-16"]
+enable_thinking = true
+thinking_budget = 4000
+
+[model.extra_params."qwen3.6-plus"]
+enable_thinking = true
+thinking_budget = 4000
+
+[model.extra_params."qwen3.6-max-preview"]
+enable_thinking = true
+thinking_budget = 4000
+
+[routing]
+enabled = true
+classifier_model = "qwen3.6-flash"
+show_routing_decision = true
+
+# 路由结果映射到费用等级（low/medium/high），不绑定具体模型名
+[routing.model_map]
+simple  = "low"
+medium  = "medium"
+complex = "high"
+
+# 单价：元/百万token（人民币，中国内地站），仅用于本地费用估算
+[pricing]
+"qwen3.6-flash"            = { input = 1,  output = 6  }
+"qwen3.6-flash-2026-04-16" = { input = 1,  output = 6  }
+"qwen3.6-plus"             = { input = 2,  output = 12 }
+"qwen3.6-max-preview"      = { input = 9,  output = 54 }
+
+[tools]
+command_timeout = 30       # execute_command 超时秒数
+output_max_chars = 3000    # 工具返回结果最大字符数
+tool_max_retries = 2       # 单轮工具调用最大重试次数
+
+[agent]
+max_history = 50
+auto_confirm = true
+scripts_subdir = "generated_scripts"
+temperature = 0.7
+top_p = 0.8
+show_thinking = true
+enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
+prompt_prefix = "雯雯在听"
+system_prompt_file = "generated_scripts/my_personality_prompt.txt"
+context_token_limit = 28000  # 上下文窗口 token 上限，超过 75% 时触发历史摘要压缩
+
+[search]
+max_results = 8        # 单次搜索返回最大条数
+timeout = 10           # 请求超时秒数
+freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
+
+[skills]
+# 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）
+# 空列表时，由各文件自身 frontmatter 中的 enabled 字段决定
+enabled = []

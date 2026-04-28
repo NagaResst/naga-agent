@@ -1,0 +1,184 @@
+import re
+
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
+
+_config: dict = {}
+
+# 域名可信度白名单
+_OFFICIAL_DOMAINS = {
+    "kubernetes.io", "docs.docker.com", "docs.python.org", "docs.aliyuncs.com",
+    "help.aliyun.com", "cloud.google.com", "docs.microsoft.com", "learn.microsoft.com",
+    "docs.aws.amazon.com", "nginx.org", "redis.io", "postgresql.org",
+    "docs.github.com", "prometheus.io", "grafana.com",
+}
+_KNOWN_DOMAINS = {
+    "github.com", "stackoverflow.com", "juejin.cn", "zhihu.com",
+    "segmentfault.com", "cnblogs.com", "csdn.net", "jianshu.com",
+    "infoq.cn", "oschina.net", "v2ex.com", "linux.do",
+}
+
+BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
+
+TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "在中国境内互联网上搜索信息（使用博查 API）。\n"
+            "返回结构化搜索结果，含标题、URL、摘要和可信度信号，AI 可据此判断是否需要用 fetch_url 读取原文。\n"
+            "适合搜索中文技术文档、运维操作、产品信息等。\n"
+            "如需获取完整内容，请在搜索后使用 fetch_url 工具访问对应 URL。\n"
+            "如结果不足或不相关，可更换关键词再次搜索，支持多轮搜索。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词，建议使用中文，尽量具体",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "返回结果数量（1-10，默认 5）",
+                },
+                "freshness": {
+                    "type": "string",
+                    "description": "时效过滤：oneDay（一天内）/ oneWeek（一周内）/ oneMonth（一个月内）/ noLimit（不限，默认）",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def set_config(cfg: dict):
+    global _config
+    _config = cfg
+
+
+def _classify_domain(url: str) -> str:
+    try:
+        domain = re.sub(r"^https?://", "", url).split("/")[0].lower()
+        # 去掉 www. 前缀
+        domain_root = domain[4:] if domain.startswith("www.") else domain
+        if domain_root in _OFFICIAL_DOMAINS or domain.endswith(tuple(
+            f".{d}" for d in _OFFICIAL_DOMAINS
+        )):
+            return "官方文档"
+        if domain_root in _KNOWN_DOMAINS or domain.endswith(tuple(
+            f".{d}" for d in _KNOWN_DOMAINS
+        )):
+            return "知名来源"
+        return "未知来源"
+    except Exception:
+        return "未知来源"
+
+
+def execute(args: dict) -> str:
+    if _requests is None:
+        return "[web_search 错误] requests 库未安装，请运行：pip install requests"
+
+    api_key = _config.get("api_key", "")
+    if not api_key:
+        return "[web_search 错误] 未配置 BOCHA_API_KEY，请在 .env 文件中设置。"
+
+    query = args.get("query", "").strip()
+    if not query:
+        return "[web_search 错误] 查询词不能为空。"
+
+    count = min(max(int(args.get("count", 5)), 1), 10)
+    freshness = args.get("freshness", _config.get("freshness", "noLimit"))
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "query": query,
+        "count": count,
+        "freshness": freshness,
+        "summary": False,
+    }
+
+    try:
+        resp = _requests.post(
+            BOCHA_SEARCH_URL,
+            json=payload,
+            headers=headers,
+            timeout=_config.get("timeout", 10),
+        )
+    except _requests.exceptions.Timeout:
+        return f"[web_search 错误] 请求超时（>{_config.get('timeout', 10)}s），请稍后重试。"
+    except _requests.exceptions.ConnectionError:
+        return "[web_search 错误] 网络连接失败，请检查网络或 API 地址是否可达。"
+
+    if resp.status_code == 401:
+        return "[web_search 错误] API Key 无效或已过期，请检查 BOCHA_API_KEY。"
+    if resp.status_code == 429:
+        return "[web_search 错误] 请求频率超限，请稍后重试。"
+    if resp.status_code != 200:
+        return f"[web_search 错误] HTTP {resp.status_code}：{resp.text[:200]}"
+
+    try:
+        data = resp.json()
+    except Exception:
+        return "[web_search 错误] 响应解析失败，返回内容非 JSON 格式。"
+
+    # 兼容博查 API 两种响应结构
+    results = []
+    if "data" in data and "webPages" in data["data"]:
+        results = data["data"]["webPages"].get("value", [])
+    elif "webPages" in data:
+        results = data["webPages"].get("value", [])
+    elif isinstance(data.get("results"), list):
+        results = data["results"]
+
+    if not results:
+        return (
+            f"[网络搜索结果]\n"
+            f"查询词：{query}\n"
+            f"结果数量：0 条\n\n"
+            f"未找到相关结果，建议：\n"
+            f"  1. 更换关键词重新搜索\n"
+            f"  2. 尝试更简短或更通用的词语\n"
+            f"  3. 如果是英文内容，可尝试直接使用 fetch_url 访问官方文档"
+        )
+
+    lines = [
+        "[网络搜索结果]",
+        f"查询词：{query}",
+        f"结果数量：{len(results)} 条  时效过滤：{freshness}",
+        "",
+    ]
+
+    for i, item in enumerate(results, 1):
+        title = item.get("name") or item.get("title") or "（无标题）"
+        url = item.get("url") or item.get("link") or ""
+        snippet = item.get("snippet") or item.get("description") or "（无摘要）"
+        site_name = item.get("siteName") or item.get("displayUrl") or ""
+        date_published = item.get("datePublished") or item.get("date") or ""
+
+        # 截断摘要
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "..."
+
+        credibility = _classify_domain(url)
+
+        lines.append(f"[{i}] 标题：{title}")
+        lines.append(f"    URL：{url}")
+        if site_name:
+            lines.append(f"    来源：{site_name}")
+        if date_published:
+            lines.append(f"    发布时间：{date_published[:10]}")
+        lines.append(f"    摘要：{snippet}")
+        lines.append(f"    可信度：{credibility}")
+        lines.append("")
+
+    lines.append("提示：如需读取完整内容，请使用 fetch_url 工具访问对应 URL。")
+    lines.append("提示：如结果不足，可更换关键词或调整 freshness 参数再次搜索。")
+
+    return "\n".join(lines)
