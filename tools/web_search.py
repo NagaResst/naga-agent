@@ -34,10 +34,12 @@ TOOL_DEFINITION = {
         "description": (
             "在互联网上搜索信息。\n"
             "优先使用博查（Bocha）API；当 Bocha 配额耗尽、限速或不可用时，自动降级至 DuckDuckGo，无需干预。\n"
-            "返回结构化搜索结果，含标题、URL、摘要和可信度信号，AI 可据此判断是否需要用 fetch_url 读取原文。\n"
-            "适合搜索技术文档、运维操作、产品信息等。\n"
-            "如需获取完整内容，请在搜索后使用 fetch_url 工具访问对应 URL。\n"
-            "如结果不足或不相关，可更换关键词再次搜索，支持多轮搜索。"
+            "返回结构化搜索结果，含标题、URL、摘要和可信度信号。\n"
+            "适合搜索技术文档、运维操作、产品信息等。\n\n"
+            "重要决策规则：\n"
+            "- 搜索后如果摘要信息不足以做出判断，必须优先使用 fetch_url 工具读取最相关结果的原文，而非换词重新搜索。\n"
+            "- 只有在 fetch_url 读取原文后仍然无法回答时，才可更换关键词再次搜索。\n"
+            "- 禁止在未读取任何原文的情况下连续多次搜索同一主题。"
         ),
         "parameters": {
             "type": "object",
@@ -121,7 +123,7 @@ def _ddg_search(query: str, count: int) -> str:
         lines.append(f"    可信度：{credibility}")
         lines.append("")
 
-    lines.append("提示：如需读取完整内容，请使用 fetch_url 工具访问对应 URL。")
+    lines.append("提示：如摘要不足以判断，请先用 fetch_url 读取上述推荐结果的原文，再决定是否需要重新搜索。")
     return "\n".join(lines)
 
 
@@ -193,9 +195,9 @@ def execute(args: dict) -> str:
             f"查询词：{query}\n"
             f"结果数量：0 条\n\n"
             f"未找到相关结果，建议：\n"
-            f"  1. 更换关键词重新搜索\n"
-            f"  2. 尝试更简短或更通用的词语\n"
-            f"  3. 如果是英文内容，可尝试直接使用 fetch_url 访问官方文档"
+            f"  1. 如果有已知 URL，可尝试直接使用 fetch_url 访问\n"
+            f"  2. 更换关键词重新搜索\n"
+            f"  3. 尝试更简短或更通用的词语"
         )
 
     lines = [
@@ -228,7 +230,14 @@ def execute(args: dict) -> str:
         lines.append(f"    可信度：{credibility}")
         lines.append("")
 
-    lines.append("提示：如需读取完整内容，请使用 fetch_url 工具访问对应 URL。")
-    lines.append("提示：如结果不足，可更换关键词或调整 freshness 参数再次搜索。")
+    # 推荐优先读取的 URL（取可信度最高的前 2 个有 URL 的结果）
+    recommended = [(i+1, url) for i, item in enumerate(results)
+                   if (url := item.get("url") or item.get("link") or "")
+                   and _classify_domain(url) in ("官方文档", "知名来源")][:2]
+    if recommended:
+        rec_lines = "  ".join(f"[{idx}] {url}" for idx, url in recommended)
+        lines.append(f"推荐优先读取：{rec_lines}")
+
+    lines.append("提示：如摘要不足以判断，请先用 fetch_url 读取上述推荐结果的原文，再决定是否需要重新搜索。")
 
     return "\n".join(lines)

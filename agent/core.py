@@ -114,6 +114,15 @@ class Agent:
         # 每轮动态构建 system prompt：base + 记忆层 + 历史摘要（不修改 config，避免累积）
         base_prompt = self.config["agent"].get("system_prompt", "").strip()
 
+        # 通用行为规则：信息不足时优先提问
+        _ask_rule = (
+            "\n\n【行为规则】\n"
+            "当且仅当缺少只有用户才知的关键信息且无法合理推断时，才简短向用户提问。"
+            "如果信息已足够执行至少一个有效动作，应先行动再根据结果调整，不要反复追问。"
+            "可以通过搜索或文件读取获取的信息不算关键信息不足。"
+        )
+        base_prompt += _ask_rule
+
         # 会话意图锚：取第一条 user 消息作为锁定开始点
         first_user = next(
             (m["content"] for m in (self.session_manager.get_history(self.session_id) or [])
@@ -225,25 +234,44 @@ class Agent:
         return extra if extra else None
 
     _PLAN_SYSTEM = (
-        "你是一个任务规划器。根据用户的任务，输出一个严格按照以下格式的执行计划，"
-        "不要有任何额外解释、不要执行任何操作、不要输出代码：\n\n"
+        "你是一个任务规划器。根据用户的任务，判断是否缺少关键信息，并输出对应格式：\n\n"
+        "情况一：信息充足，可以规划执行 → 输出步骤列表：\n"
         "[ ] Step 1: <具体步骤描述>\n"
         "[ ] Step 2: <具体步骤描述>\n"
         "...\n\n"
-        "要求：\n"
+        "情况二：缺少只有用户才能提供的关键信息 → 输出提问：\n"
+        "【需要提问】\n"
+        "- <问题1>\n"
+        "- <问题2>\n\n"
+        "判断标准：\n"
+        "- 如果缺少的信息可以通过搜索、读文件等工具自行获取，属于情况一\n"
+        "- 如果信息已足够执行至少一个有效动作（如搜索、查询），即使不完美也属于情况一，先行动再根据结果调整\n"
+        "- 只有在确实无法合理推断且没有可用起点时，才属于情况二\n"
+        "- 用户的偏好、细节需求等可在执行过程中自然发现，不必须提前追问\n\n"
+        "步骤列表要求：\n"
         "- 每个步骤必须是可独立执行的最小工作单元\n"
         "- 步骤数量 3~8 个，不要过于拆碎也不要合并复杂操作\n"
-        "- 只输出步骤列表，不要有前言和总结"
+        "- 只输出步骤列表或提问，不要有前言和总结"
     )
 
     def _plan_node(self, user_input: str, messages: list, model: str):
-        """规划节点：生成 checkbox 步骤列表并展示，返回 (steps, plan_text)。"""
+        """规划节点：生成 checkbox 步骤列表或识别信息缺口，返回 (steps, plan_text, needs_question)。"""
         import re as _re
         from rich.panel import Panel as RichPanel
 
+        # 检测用户是否已回答过 AI 的提问：历史中有 assistant 含【需要提问】+ 紧接 user 回复
+        _answered_hint = ""
+        for i in range(len(messages) - 1):
+            m_cur = messages[i]
+            m_next = messages[i + 1]
+            if (m_cur.get("role") == "assistant" and "【需要提问】" in m_cur.get("content", "")
+                    and m_next.get("role") == "user"):
+                _answered_hint = "\n\n注意：用户已回答过你的提问，请优先根据已有信息行动，除非仍有无法合理推断的关键信息缺失。"
+                break
+
         plan_messages = [
             {"role": "system", "content": self._PLAN_SYSTEM},
-            {"role": "user", "content": user_input},
+            {"role": "user", "content": user_input + _answered_hint},
         ]
         try:
             resp = self._client.chat.completions.create(
@@ -257,6 +285,17 @@ class Agent:
             plan_text = f"[ ] Step 1: 完成用户任务：{user_input}"
             self.console.print(f"[dim yellow]规划阶段异常（{e}），使用默认单步计划[/dim yellow]")
 
+        # 检测"需要提问"信号
+        needs_question = "【需要提问】" in plan_text
+        if needs_question:
+            self.console.print(RichPanel(
+                plan_text,
+                title="[bold yellow]需要更多信息[/bold yellow]",
+                border_style="yellow",
+                padding=(0, 1),
+            ))
+            return [], plan_text, True
+
         self.console.print(RichPanel(
             plan_text,
             title="[bold cyan]执行计划[/bold cyan]",
@@ -268,7 +307,7 @@ class Agent:
         steps = _re.findall(r'\[ \]\s*Step\s*\d+:\s*(.+)', plan_text)
         if not steps:
             steps = [line.strip() for line in plan_text.splitlines() if line.strip()]
-        return steps, plan_text
+        return steps, plan_text, False
 
     _REPLAN_SYSTEM = (
         "你是一个任务监控器。根据当前步骤描述和最近工具调用情况，"
@@ -349,7 +388,12 @@ class Agent:
 
         # 规划节点：medium / complex 任务先生成执行计划
         if complexity in ("medium", "complex"):
-            steps, plan_text = self._plan_node(user_input, messages, active_model)
+            steps, plan_text, needs_question = self._plan_node(user_input, messages, active_model)
+            if needs_question:
+                # 信息不足，直接返回提问内容，跳过工具循环
+                question_text = plan_text.replace("【需要提问】", "").strip()
+                self.session_manager.append_message(self.session_id, "assistant", question_text)
+                return question_text
             messages.append({
                 "role": "system",
                 "content": f"【执行计划】\n{plan_text}\n\n请严格按照上述步骤顺序完成任务。",
