@@ -309,6 +309,71 @@ class Agent:
             steps = [line.strip() for line in plan_text.splitlines() if line.strip()]
         return steps, plan_text, False
 
+    _SUMMARIZE_SYSTEM = (
+        "你是一个结果整理助手。以下是按步骤执行任务时每一步的输出，"
+        "请将所有步骤的结果整合为一份连贯、完整、清晰的最终回答。\n"
+        "要求：\n"
+        "- 去除重复信息，合并相关内容\n"
+        "- 保留所有关键事实和数据\n"
+        "- 以用户易读的方式组织，不要保留步骤编号\n"
+        "- 如果某步执行失败，如实说明但不重复错误细节\n"
+        "- 直接输出整合结果，不要有前言"
+    )
+
+    def _summarize_steps(self, user_input: str, steps: list, step_contents: list, model: str) -> str:
+        """汇总多步骤执行结果为一份连贯的最终回答。"""
+        # 1. 保存步骤内容到记忆，确保压缩后信息不丢失
+        if self._memory_manager and self._memory_manager.available:
+            for i, (step, content) in enumerate(zip(steps, step_contents), 1):
+                self._memory_manager.add(
+                    [{"role": "assistant", "content": f"[Step {i}: {step}]\n{content}"}],
+                    layer="episodic",
+                )
+
+        # 2. 构造完整的步骤文本（不截断）
+        steps_text = ""
+        for i, (step, content) in enumerate(zip(steps, step_contents), 1):
+            steps_text += f"### Step {i}: {step}\n{content}\n\n"
+
+        # 3. 估算 token，若超上下文窗口则压缩步骤内容
+        context_window = get_context_window(model, self.config["agent"].get("context_token_limit", 0))
+        reserved_tokens = 2000
+        steps_messages = [{"role": "user", "content": steps_text}]
+        estimated_tokens = self._token_tracker.estimate(steps_messages)
+        if estimated_tokens + reserved_tokens > context_window:
+            threshold = 0.5
+            steps_messages = summarizer.compress_pipeline(
+                steps_messages,
+                self._token_tracker,
+                context_window - reserved_tokens,
+                threshold,
+                self.config["agent"].get("tool_output_max_chars", 300),
+            )
+            steps_text = steps_messages[0]["content"] if steps_messages else steps_text
+
+        # 4. 调用模型汇总
+        try:
+            resp = self._client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": self._SUMMARIZE_SYSTEM},
+                    {"role": "user", "content": f"用户原始问题：{user_input}\n\n各步骤执行结果：\n\n{steps_text}"},
+                ],
+                temperature=0.3,
+                stream=True,
+            )
+            summary = ""
+            for chunk in resp:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    summary += content
+                    self.console.print(content, end="", markup=False, highlight=False)
+            self.console.print()
+            return summary
+        except Exception as e:
+            self.console.print(f"[dim yellow]汇总失败（{e}），返回原始结果[/dim yellow]")
+            return "\n\n".join(step_contents)
+
     _REPLAN_SYSTEM = (
         "你是一个任务监控器。根据当前步骤描述和最近工具调用情况，"
         "判断执行状态并只输出以下三个词之一，不要有任何其他内容：\n"
@@ -411,9 +476,10 @@ class Agent:
         _acc_output = 0
         _task_aborted = False
 
-        def _run_tool_loop(step_desc: str = ""):
+        def _run_tool_loop(step_desc: str = "", silent: bool = False):
             """单个 step（或无 plan 模式）的工具调用循环。
             返回 (full_content, loop_break_reason)，loop_break_reason: 'done'/'abort'
+            silent=True 时不输出中间过程到终端，但 full_content 正常累加。
             """
             nonlocal _acc_input, _acc_output, _task_aborted
 
@@ -457,17 +523,19 @@ class Agent:
                     rc = getattr(delta, "reasoning_content", None)
                     if rc:
                         if not in_reasoning:
-                            if self.config["agent"].get("show_thinking", True):
+                            if not silent and self.config["agent"].get("show_thinking", True):
                                 self.console.print("\n[dim italic]思考中...[/dim italic]")
                             in_reasoning = True
-                        if self.config["agent"].get("show_thinking", True):
+                        if not silent and self.config["agent"].get("show_thinking", True):
                             self.console.print(f"[dim]{rc}[/dim]", end="")
 
                     if delta.content:
                         if in_reasoning:
-                            self.console.print()
+                            if not silent:
+                                self.console.print()
                             in_reasoning = False
-                        self.console.print(delta.content, end="", markup=False, highlight=False)
+                        if not silent:
+                            self.console.print(delta.content, end="", markup=False, highlight=False)
                         full_content += delta.content
 
                     if delta.tool_calls:
@@ -486,7 +554,8 @@ class Agent:
                                 tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
 
                 if full_content or in_reasoning:
-                    self.console.print()
+                    if not silent:
+                        self.console.print()
 
                 # 模型主动停止 or [STEP_DONE] 信号 → 当前 step 完成
                 if finish_reason != "tool_calls" or "[STEP_DONE]" in full_content:
@@ -516,28 +585,29 @@ class Agent:
                     except json.JSONDecodeError:
                         tool_args = {}
 
-                    show_thinking = self.config["agent"].get("show_thinking", True)
-                    if show_thinking:
-                        self.console.print(f"\n[bold cyan]调用工具：[/bold cyan]{tool_name}")
-                        if tool_name == "execute_command":
-                            cmd = tool_args.get("command", "")
-                            desc = tool_args.get("description", "")
-                            if cmd:
-                                self.console.print(f"[dim]$ {cmd}[/dim]")
-                            if desc:
-                                self.console.print(f"[dim]意图：{desc}[/dim]")
-                        elif tool_name == "generate_script":
-                            filename = tool_args.get("filename", "")
-                            language = tool_args.get("language", "")
-                            if filename:
-                                self.console.print(f"[dim]生成文件：{filename}  语言：{language}[/dim]")
-                        elif tool_name == "read_file":
-                            self.console.print(f"[dim]读取：{tool_args.get('path', '')}[/dim]")
-                        elif tool_name == "edit_file":
-                            self.console.print(f"[dim]编辑：{tool_args.get('path', '')}[/dim]")
-                    else:
-                        hint = self._humanize_tool_hint(tool_name, tool_args)
-                        self.console.print(f"[dim italic]{hint}[/dim italic]")
+                    if not silent:
+                        show_thinking = self.config["agent"].get("show_thinking", True)
+                        if show_thinking:
+                            self.console.print(f"\n[bold cyan]调用工具：[/bold cyan]{tool_name}")
+                            if tool_name == "execute_command":
+                                cmd = tool_args.get("command", "")
+                                desc = tool_args.get("description", "")
+                                if cmd:
+                                    self.console.print(f"[dim]$ {cmd}[/dim]")
+                                if desc:
+                                    self.console.print(f"[dim]意图：{desc}[/dim]")
+                            elif tool_name == "generate_script":
+                                filename = tool_args.get("filename", "")
+                                language = tool_args.get("language", "")
+                                if filename:
+                                    self.console.print(f"[dim]生成文件：{filename}  语言：{language}[/dim]")
+                            elif tool_name == "read_file":
+                                self.console.print(f"[dim]读取：{tool_args.get('path', '')}[/dim]")
+                            elif tool_name == "edit_file":
+                                self.console.print(f"[dim]编辑：{tool_args.get('path', '')}[/dim]")
+                        else:
+                            hint = self._humanize_tool_hint(tool_name, tool_args)
+                            self.console.print(f"[dim italic]{hint}[/dim italic]")
 
                     tool_result = self._call_tool(tool_name, tool_args)
 
@@ -585,15 +655,18 @@ class Agent:
 
         # ── 主执行逻辑 ──────────────────────────────────────────────
         last_content = ""
+        step_contents = []  # 收集每步的输出
         if steps:
             # plan 模式：逐 step 执行
+            silent_steps = not self.config["agent"].get("show_thinking", True)
             for i, step_desc in enumerate(steps, 1):
                 self.console.print(f"\n[bold cyan]► Step {i}/{len(steps)}：[/bold cyan]{step_desc}")
                 messages.append({
                     "role": "system",
                     "content": f"【当前步骤 {i}/{len(steps)}】{step_desc}",
                 })
-                last_content, reason = _run_tool_loop(step_desc)
+                last_content, reason = _run_tool_loop(step_desc, silent=silent_steps)
+                step_contents.append(last_content)
                 self.console.print(f"[dim green]✓ Step {i} 完成[/dim green]")
                 if _task_aborted:
                     self.console.print("[bold red]任务已中止。[/bold red]")
@@ -601,6 +674,11 @@ class Agent:
         else:
             # simple 模式：单层循环（无 step 分割，step_desc 为空，re-planner 不介入）
             last_content, _ = _run_tool_loop("")
+
+        # 多步骤汇总
+        if steps and step_contents and not _task_aborted:
+            self.console.print("\n[bold green]所有步骤执行完毕，正在整理结果…[/bold green]")
+            last_content = self._summarize_steps(user_input, steps, step_contents, low_model)
 
         # 记录 session + token + 记忆
         self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(last_content))
