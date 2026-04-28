@@ -7,7 +7,7 @@ _CORE_CACHE_PREFIX = "naga_agent:memory:core:"
 
 def _build_mem0_config(memory_cfg: dict, redis_cfg: dict, api_key: str, base_url: Optional[str]):
     """根据 config.toml [memory] 段构建 mem0 MemoryConfig。"""
-    from mem0 import MemoryConfig, VectorStoreConfig, EmbedderConfig, LlmConfig
+    from mem0.configs.base import MemoryConfig, VectorStoreConfig, EmbedderConfig, LlmConfig
 
     backend = memory_cfg.get("backend", "chroma")
     embedder_cfg = memory_cfg.get("embedder", {})
@@ -20,7 +20,7 @@ def _build_mem0_config(memory_cfg: dict, redis_cfg: dict, api_key: str, base_url
             provider="ollama",
             config={
                 "model": embedder_cfg.get("model", "nomic-embed-text"),
-                "base_url": embedder_base_url or "http://localhost:11434",
+                "ollama_base_url": embedder_base_url or "http://localhost:11434",
             },
         )
     else:
@@ -29,17 +29,18 @@ def _build_mem0_config(memory_cfg: dict, redis_cfg: dict, api_key: str, base_url
             config={
                 "model": embedder_cfg.get("model", "text-embedding-3-small"),
                 "api_key": api_key,
-                **({"base_url": embedder_base_url} if embedder_base_url else {}),
+                **({"openai_base_url": embedder_base_url} if embedder_base_url else {}),
             },
         )
 
     # LLM 配置（mem0 内部提取记忆时使用，复用主模型接入点）
+    llm_model = memory_cfg.get("llm_model", "qwen3.6-flash")
     llm = LlmConfig(
         provider="openai",
         config={
-            "model": "gpt-4o-mini",
+            "model": llm_model,
             "api_key": api_key,
-            **({"base_url": base_url} if base_url else {}),
+            **({"openai_base_url": base_url} if base_url else {}),
         },
     )
 
@@ -168,7 +169,7 @@ class MemoryManager:
         """删除 Layer1 核心记忆（向量库 + Redis 缓存）。"""
         if self.available:
             try:
-                results = self._mem0.search(key, user_id=user_id, filters={"layer": "core"}, limit=10)
+                results = self._mem0.search(key, filters={"user_id": user_id, "layer": "core"}, top_k=10)
                 memories = results if isinstance(results, list) else results.get("results", [])
                 for m in memories:
                     mem_key = (m.get("metadata") or {}).get("key", "")
@@ -211,7 +212,7 @@ class MemoryManager:
         if not self.available:
             return []
         try:
-            results = self._mem0.search("", user_id=user_id, filters={"layer": "core"}, limit=self._cfg.get("core_max_items", 20))
+            results = self._mem0.search("", filters={"user_id": user_id, "layer": "core"}, top_k=self._cfg.get("core_max_items", 20))
             memories = results if isinstance(results, list) else results.get("results", [])
             items = []
             for m in memories:
@@ -237,7 +238,7 @@ class MemoryManager:
         if not self.available or not query.strip():
             return []
         try:
-            results = self._mem0.search(query, user_id=user_id, filters={"layer": "episodic"}, limit=top_k)
+            results = self._mem0.search(query, filters={"user_id": user_id, "layer": "episodic"}, top_k=top_k)
             memories = results if isinstance(results, list) else results.get("results", [])
             return [m.get("memory", "") or m.get("text", "") for m in memories if m.get("memory") or m.get("text")]
         except Exception as e:

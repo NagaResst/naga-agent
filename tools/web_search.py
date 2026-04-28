@@ -5,6 +5,11 @@ try:
 except ImportError:
     _requests = None
 
+try:
+    from duckduckgo_search import DDGS as _DDGS
+except ImportError:
+    _DDGS = None
+
 _config: dict = {}
 
 # 域名可信度白名单
@@ -27,9 +32,10 @@ TOOL_DEFINITION = {
     "function": {
         "name": "web_search",
         "description": (
-            "在中国境内互联网上搜索信息（使用博查 API）。\n"
+            "在互联网上搜索信息。\n"
+            "优先使用博查（Bocha）API；当 Bocha 配额耗尽、限速或不可用时，自动降级至 DuckDuckGo，无需干预。\n"
             "返回结构化搜索结果，含标题、URL、摘要和可信度信号，AI 可据此判断是否需要用 fetch_url 读取原文。\n"
-            "适合搜索中文技术文档、运维操作、产品信息等。\n"
+            "适合搜索技术文档、运维操作、产品信息等。\n"
             "如需获取完整内容，请在搜索后使用 fetch_url 工具访问对应 URL。\n"
             "如结果不足或不相关，可更换关键词再次搜索，支持多轮搜索。"
         ),
@@ -78,19 +84,62 @@ def _classify_domain(url: str) -> str:
         return "未知来源"
 
 
+def _ddg_search(query: str, count: int) -> str:
+    """使用 DuckDuckGo 搜索，作为 Bocha 不可用时的 fallback。"""
+    if _DDGS is None:
+        return "[web_search 错误] duckduckgo-search 未安装，请运行：pip install duckduckgo-search"
+
+    try:
+        results = list(_DDGS().text(query, max_results=count))
+    except Exception as e:
+        return f"[web_search 错误] DuckDuckGo 搜索失败：{e}"
+
+    if not results:
+        return (
+            f"[网络搜索结果]（DuckDuckGo）\n"
+            f"查询词：{query}\n"
+            f"结果数量：0 条\n\n"
+            f"未找到相关结果，建议更换关键词重新搜索。"
+        )
+
+    lines = [
+        "[网络搜索结果]（DuckDuckGo · Bocha 不可用已自动切换）",
+        f"查询词：{query}",
+        f"结果数量：{len(results)} 条",
+        "",
+    ]
+    for i, item in enumerate(results, 1):
+        title = item.get("title") or "（无标题）"
+        url = item.get("href") or item.get("url") or ""
+        snippet = item.get("body") or item.get("snippet") or "（无摘要）"
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "..."
+        credibility = _classify_domain(url)
+        lines.append(f"[{i}] 标题：{title}")
+        lines.append(f"    URL：{url}")
+        lines.append(f"    摘要：{snippet}")
+        lines.append(f"    可信度：{credibility}")
+        lines.append("")
+
+    lines.append("提示：如需读取完整内容，请使用 fetch_url 工具访问对应 URL。")
+    return "\n".join(lines)
+
+
 def execute(args: dict) -> str:
-    if _requests is None:
-        return "[web_search 错误] requests 库未安装，请运行：pip install requests"
-
-    api_key = _config.get("api_key", "")
-    if not api_key:
-        return "[web_search 错误] 未配置 BOCHA_API_KEY，请在 .env 文件中设置。"
-
     query = args.get("query", "").strip()
     if not query:
         return "[web_search 错误] 查询词不能为空。"
 
     count = min(max(int(args.get("count", 5)), 1), 10)
+
+    api_key = _config.get("api_key", "")
+    # 无 Bocha key 时直接走 DDG
+    if not api_key:
+        return _ddg_search(query, count)
+
+    if _requests is None:
+        return _ddg_search(query, count)
+
     freshness = args.get("freshness", _config.get("freshness", "noLimit"))
 
     headers = {
@@ -112,14 +161,15 @@ def execute(args: dict) -> str:
             timeout=_config.get("timeout", 10),
         )
     except _requests.exceptions.Timeout:
-        return f"[web_search 错误] 请求超时（>{_config.get('timeout', 10)}s），请稍后重试。"
+        return _ddg_search(query, count)
     except _requests.exceptions.ConnectionError:
-        return "[web_search 错误] 网络连接失败，请检查网络或 API 地址是否可达。"
+        return _ddg_search(query, count)
 
     if resp.status_code == 401:
-        return "[web_search 错误] API Key 无效或已过期，请检查 BOCHA_API_KEY。"
-    if resp.status_code == 429:
-        return "[web_search 错误] 请求频率超限，请稍后重试。"
+        return "[web_search 错误] Bocha API Key 无效或已过期，请检查 BOCHA_API_KEY。"
+    if resp.status_code in (402, 429):
+        # 配额耗尽或限速 → 自动降级至 DDG
+        return _ddg_search(query, count)
     if resp.status_code != 200:
         return f"[web_search 错误] HTTP {resp.status_code}：{resp.text[:200]}"
 

@@ -12,3 +12,4 @@ lxml>=5.0.0
 mem0ai>=0.1.0
 chromadb>=0.5.0         # 默认向量后端（内嵌，无需独立服务）
 # qdrant-client>=1.9.0  # 可选：使用 Qdrant 后端时安装
+duckduckgo-search>=6.0.0  # web_search fallback，Bocha 不可用时自动切换

@@ -4,8 +4,14 @@ from datetime import datetime
 def _load_tiktoken():
     try:
         import tiktoken
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:
+        # 依次尝试各编码，优先使用已缓存的
+        for enc_name in ("cl100k_base", "o200k_base", "p50k_base"):
+            try:
+                return tiktoken.get_encoding(enc_name)
+            except Exception:
+                continue
+        return None
+    except ImportError:
         return None
 
 

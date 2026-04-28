@@ -2,11 +2,12 @@ import re
 import hashlib
 
 # 触发 complex/high 路由的关键词
+# 只保留「动作意图」明确的词，避免「架构/设计/分析」等单独出现时的假阳性
 _COMPLEX_KEYWORDS = re.compile(
-    r"(写代码|生成代码|编写|实现|开发|设计|架构|优化|重构|分析|调试|排查|解释原理"
-    r"|深入|详细|完整|全面|系统|对比|评估|方案|部署|迁移|性能|安全|漏洞"
-    r"|write code|implement|develop|design|architecture|optimize|refactor"
-    r"|analyze|debug|explain|comprehensive|detailed|complete)",
+    r"(写代码|生成代码|编写|实现|重构|调试|排查|解释原理|帮我写|帮我实现"
+    r"|部署|迁移|漏洞|攻击|注入"
+    r"|write code|implement|refactor|debug|develop a|build a|create a"
+    r"|step[- ]by[- ]step|step by step)",
     re.IGNORECASE,
 )
 
@@ -23,9 +24,19 @@ _CLASSIFIER_SYSTEM = (
     "medium\n"
     "complex\n\n"
     "判断标准：\n"
-    "- simple：简单问候、单一事实查询、短文本翻译\n"
-    "- medium：需要一定推理或知识整合，但不涉及大量代码或深度分析\n"
-    "- complex：代码生成、系统设计、深度分析、长文档处理、多步骤技术任务"
+    "- simple：简单问候、单一事实查询、短词翻译、是非题\n"
+    "- medium：需要知识整合或一定推理，但不需要写代码或深度分析\n"
+    "- complex：代码生成/修改、系统设计、深度对比分析、多步骤技术任务、长文档处理\n\n"
+    "示例（输入 → 输出）：\n"
+    "你好 → simple\n"
+    "什么是 TCP/IP？ → simple\n"
+    "把 apple 翻译成中文 → simple\n"
+    "Redis 和 Memcached 有什么区别？ → medium\n"
+    "解释一下微服务架构的优缺点 → medium\n"
+    "K8s 中 Deployment 和 StatefulSet 的适用场景 → medium\n"
+    "帮我写一个 Python 脚本，定时从 MySQL 同步数据到 Redis → complex\n"
+    "分析这段代码的性能瓶颈并重构 → complex\n"
+    "设计一个高可用的消息队列系统，给出架构图和关键组件 → complex"
 )
 
 
@@ -53,16 +64,29 @@ class ModelRouter:
                 return m
         return self._default_model
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """CJK 字符感知的 token 估算：中文约 1.5 char/token，ASCII 约 0.25 word/token。"""
+        cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff'
+                        or '\u3400' <= c <= '\u4dbf'
+                        or '\uf900' <= c <= '\ufaff')
+        ascii_words = len(re.findall(r'[a-zA-Z0-9]+', text))
+        return max(1, int(cjk_count * 1.5 + ascii_words * 0.3 + (len(text) - cjk_count - ascii_words) * 0.4))
+
     def _rule_route(self, user_input: str, history_len: int, agent_cfg: dict) -> str | None:
         """规则层路由，返回模型名或 None（表示需要分类层）。"""
         text = user_input.strip()
-        token_estimate = max(1, int(len(text) * 0.4))
+        token_estimate = self._estimate_tokens(text)
+
+        # 超长输入必然是 complex，跳过分类器节省 API 调用
+        if token_estimate > 400:
+            return self.get_model_by_tier(self._model_map.get("complex", "high"))
 
         # 明显简单
         if token_estimate < 30 and _SIMPLE_KEYWORDS.match(text):
             return self.get_model_by_tier(self._model_map.get("simple", "low"))
 
-        # 明显复杂
+        # 动作意图明确的复杂请求
         if _COMPLEX_KEYWORDS.search(text):
             return self.get_model_by_tier(self._model_map.get("complex", "high"))
 

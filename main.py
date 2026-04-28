@@ -44,31 +44,6 @@ HELP_TEXT = """
 """
 
 
-def select_model(console: Console, config: dict) -> str:
-    available = config["model"]["available"]
-    default = config["model"]["default"]
-    console.print("\n[bold]可用模型：[/bold]")
-    for i, m in enumerate(available, 1):
-        marker = " [green](默认)[/green]" if m == default else ""
-        console.print(f"  {i}. {m}{marker}")
-    choice = Prompt.ask(
-        "请选择模型编号，或直接回车使用默认",
-        default="",
-        console=console,
-    ).strip()
-    if not choice:
-        return default
-    try:
-        idx = int(choice) - 1
-        if 0 <= idx < len(available):
-            return available[idx]
-    except ValueError:
-        if choice in available:
-            return choice
-    console.print(f"[yellow]输入无效，使用默认模型：{default}[/yellow]")
-    return default
-
-
 def select_session(console: Console, session_manager: SessionManager) -> str:
     sessions = session_manager.list_sessions()[:10]
     console.print("\n[bold]历史会话：[/bold]")
@@ -134,7 +109,7 @@ def main():
         console.print(f"[bold red]{e}[/bold red]")
         sys.exit(1)
 
-    model = select_model(console, config)
+    model = config["model"]["default"]
     session_id = select_session(console, session_manager)
 
     agent = Agent(config, session_manager, session_id, model, console)

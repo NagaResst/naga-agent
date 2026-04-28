@@ -192,6 +192,34 @@ class Agent:
             return f"⏳ 正在操作记忆…"
         return "⏳ 正在处理，请稍候…"
 
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """脱除常见 Markdown 语法，返回纯文本。"""
+        import re
+        # 代码块（```...``` 或 ~~~...~~~）替换为其内容
+        text = re.sub(r'```[\w]*\n?', '', text)
+        text = re.sub(r'~~~[\w]*\n?', '', text)
+        # 粗体 / 斜体
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
+        text = re.sub(r'_(.+?)_', r'\1', text, flags=re.DOTALL)
+        # 标题（行首 # 开头）
+        text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+        # 表格分隔行（|---|---| 类）
+        text = re.sub(r'^\|[-|: ]+\|\s*$', '', text, flags=re.MULTILINE)
+        # 表格行：去掉首尾 |，单元格用空格连接
+        text = re.sub(r'^\|(.+)\|\s*$',
+                      lambda m: '  '.join(c.strip() for c in m.group(1).split('|')),
+                      text, flags=re.MULTILINE)
+        # 引用块
+        text = re.sub(r'^>+\s?', '', text, flags=re.MULTILINE)
+        # 行内代码
+        text = re.sub(r'`(.+?)`', r'\1', text)
+        # 多余空行收拢
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
     def _build_extra_body(self, model: str):
         extra = dict(self.config["model"].get("extra_params", {}).get(model, {}))
         return extra if extra else None
@@ -201,7 +229,8 @@ class Agent:
         messages = self._get_messages()
         agent_cfg = self.config["agent"]
         tools_cfg = self.config.get("tools", {})
-        tool_max_retries = tools_cfg.get("tool_max_retries", 2)
+        tool_max_rounds = tools_cfg.get("tool_max_rounds", 10)
+        tool_max_errors = tools_cfg.get("tool_max_errors", 3)
 
         # 模型路由
         history_len = len(self.session_manager.get_history(self.session_id))
@@ -217,7 +246,8 @@ class Agent:
         if self.config.get("routing", {}).get("show_routing_decision", True) and route_reason != "manual":
             self.console.print(f"[dim]路由决策：{active_model}  ({route_reason})  预估输入 ~{estimated_input} tokens[/dim]")
 
-        tool_retry_count = 0
+        tool_round_count = 0
+        tool_error_count = 0
         # 累加所有轮次工具调用的 token，避免中间轮消耗丢失
         _acc_input = 0
         _acc_output = 0
@@ -293,15 +323,15 @@ class Agent:
                 self.console.print()  # 流式结束后换行
 
             if finish_reason == "tool_calls":
-                # 工具重试上限检查
-                if tool_retry_count >= tool_max_retries:
+                # 轮次上限检查（防死循环）
+                if tool_round_count >= tool_max_rounds:
                     self.console.print(
-                        f"[bold red]工具调用已达最大重试次数（{tool_max_retries}），停止执行。[/bold red]"
+                        f"[bold red]工具调用已达最大轮次（{tool_max_rounds}），停止执行。[/bold red]"
                     )
-                    self.session_manager.append_message(self.session_id, "assistant", full_content or "[TOOL_FAILED]")
+                    self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content) or "[TOOL_LIMIT]")
                     break
 
-                tool_retry_count += 1
+                tool_round_count += 1
 
                 messages.append({
                     "role": "assistant",
@@ -351,14 +381,28 @@ class Agent:
 
                     tool_result = self._call_tool(tool_name, tool_args)
 
+                    # 连续错误计数
+                    if tool_result.startswith("错误："):
+                        tool_error_count += 1
+                    else:
+                        tool_error_count = 0
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "name": tool_name,
                         "content": tool_result,
                     })
+
+                # 连续错误上限检查（防错误风暴）
+                if tool_error_count >= tool_max_errors:
+                    self.console.print(
+                        f"[bold red]工具连续错误已达上限（{tool_max_errors}），停止执行。[/bold red]"
+                    )
+                    self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content) or "[TOOL_ERROR]")
+                    break
             else:
-                self.session_manager.append_message(self.session_id, "assistant", full_content)
+                self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(full_content))
                 # 记录所有轮次累积的真实 token 消耗（含中间工具调用轮次）
                 if _acc_input or _acc_output:
                     self._token_tracker.record_usage(

@@ -56,7 +56,8 @@ complex = "high"
 [tools]
 command_timeout = 30       # execute_command 超时秒数
 output_max_chars = 3000    # 工具返回结果最大字符数
-tool_max_retries = 2       # 单轮工具调用最大重试次数
+tool_max_rounds = 30       # 单次对话最大工具调用轮次（防死循环）
+tool_max_errors = 3        # 连续工具错误上限（防错误风暴）
 
 [agent]
 max_history = 50
@@ -95,11 +96,13 @@ min_content_length = 20
 episodic_top_k = 3
 # Layer1 核心记忆全量注入 system prompt 的最大条数
 core_max_items = 20
+# mem0 内部提取记忆时使用的 LLM（需与 [model].base_url 接入点兼容）
+llm_model = "qwen3.6-flash"
 
 [memory.embedder]
 # 嵌入模型供应商：openai / ollama
 provider = "openai"
-model = "text-embedding-3-small"
+model = "text-embedding-v2"   # DashScope 兼容模型，维度 1536，与 text-embedding-3-small 相同
 # 留空则继承 [model].base_url
 base_url = ""
 
