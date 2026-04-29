@@ -67,12 +67,20 @@ class Agent:
 
         # 启动时扫描并加载 skills/ 目录下所有 skill
         _project_root = os.path.dirname(os.path.dirname(__file__))
-        _skills_dir = os.path.join(_project_root, "skills")
-        _enabled_names = config.get("skills", {}).get("enabled", [])
-        self._skills: list = discover_skills(_skills_dir, _enabled_names)
+        self._skills_dir = os.path.join(_project_root, "skills")
+        self._skills_enabled_names = config.get("skills", {}).get("enabled", [])
+        self._skills: list = discover_skills(self._skills_dir, self._skills_enabled_names)
         if self._skills:
             active = [s["name"] for s in self._skills if s["enabled"]]
             console.print(f"[dim]已加载 {len(self._skills)} 个 skill，激活：{active or '无'}[/dim]")
+
+        # 注入 agent 引用到 skill_manager 工具
+        import tools.skill_manager as skill_manager_module
+        skill_manager_module.set_agent(self)
+
+    def reload_skills(self):
+        """重新扫描 skills/ 目录，热更新已加载的 skill 列表。"""
+        self._skills = discover_skills(self._skills_dir, self._skills_enabled_names)
 
     def _get_messages(self) -> list:
         history = self.session_manager.get_history(self.session_id)
