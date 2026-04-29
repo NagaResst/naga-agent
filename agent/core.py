@@ -664,6 +664,12 @@ class Agent:
                 return True
         return False
 
+    def switch_session(self, new_session_id: str):
+        """切换到指定会话：更新 session_id、重载历史摘要、重置 token 计数。"""
+        self.session_id = new_session_id
+        self._history_summary = self.session_manager.get_summary(new_session_id)
+        self._token_tracker = TokenTracker()
+
     def toggle_auto_confirm(self):
         self.auto_confirm = not self.auto_confirm
         state = "开启（自动确认）" if self.auto_confirm else "关闭（需手动确认）"

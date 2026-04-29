@@ -209,6 +209,9 @@ enabled = ["ops-expert", "code-reviewer"]
 | `/skill list` | 查看所有 Skill |
 | `/skill on/off <名称>` | 激活/停用 Skill |
 | `/session` | 当前会话信息（含 token 和费用） |
+| `/session new` | 创建并切换到新会话 |
+| `/session list` | 列出最近 10 条历史会话 |
+| `/session switch <N>` | 切换到 list 中编号为 N 的会话 |
 | `/token` | 详细 token 用量明细 |
 | `/history` | 最近 5 条对话摘要 |
 | `/prompt` | 查看当前 system prompt |

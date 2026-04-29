@@ -34,6 +34,9 @@ HELP_TEXT = """
   /prompt set <内容>  设置新的系统提示词
   /prompt clear       清除系统提示词
   /session            显示当前会话信息（含 token 消耗和费用）
+  /session new        创建并切换到新会话
+  /session list       列出最近 10 条历史会话
+  /session switch <N> 切换到 list 中编号为 N 的会话
   /token              显示本会话详细 token 用量和费用明细
   /skill list         显示所有可用 skill 及激活状态
   /skill on <名称>    激活指定 skill
@@ -216,11 +219,45 @@ def main():
                     f"[bold]¥{summary['total_cost_cny']:.6f}[/bold]"
                 )
 
+        elif user_input == "/session new":
+            new_id = session_manager.create_session("new")
+            agent.switch_session(new_id)
+            is_new_session = True
+            console.print(f"[green]已创建并切换到新会话：{new_id}[/green]")
+
+        elif user_input == "/session list":
+            sessions = session_manager.list_sessions()[:10]
+            if not sessions:
+                console.print("[dim]暂无历史会话。[/dim]")
+            else:
+                console.print("\n[bold]历史会话（最近 10 条）：[/bold]")
+                for i, s in enumerate(sessions, 1):
+                    marker = " [bold cyan]← 当前[/bold cyan]" if s["id"] == agent.session_id else ""
+                    console.print(
+                        f"  {i}. [{s['created_at'][:19]}] {s['name']}"
+                        f"  [dim]({s['message_count']} 条消息)[/dim]{marker}"
+                    )
+
+        elif user_input.startswith("/session switch "):
+            arg = user_input[16:].strip()
+            sessions = session_manager.list_sessions()[:10]
+            try:
+                idx = int(arg) - 1
+                if 0 <= idx < len(sessions):
+                    target = sessions[idx]
+                    agent.switch_session(target["id"])
+                    is_new_session = session_manager.get_history(target["id"]) == []
+                    console.print(f"[green]已切换到会话：{target['name']}（{target['id']}）[/green]")
+                else:
+                    console.print(f"[red]编号超出范围，请用 /session list 查看有效编号。[/red]")
+            except ValueError:
+                console.print("[red]用法：/session switch <编号>，编号为整数。[/red]")
+
         elif user_input == "/session":
-            history = session_manager.get_history(session_id)
+            history = session_manager.get_history(agent.session_id)
             current_prompt = agent.config["agent"].get("system_prompt", "")
             summary = agent.get_token_summary()
-            console.print(f"会话 ID：{session_id}")
+            console.print(f"会话 ID：{agent.session_id}")
             console.print(f"当前模型：{agent.model}")
             console.print(f"消息总数：{len(history)}")
             console.print(f"自动确认：{'是' if agent.auto_confirm else '否'}")
