@@ -53,9 +53,9 @@ complex = "high"
 [tools]
 command_timeout = 30       # execute_command 超时秒数
 output_max_chars = 3000    # 工具返回结果最大字符数
-tool_max_rounds = 30       # 单次对话最大工具调用轮次（防死循环）
+tool_max_rounds = 90       # 单次对话最大工具调用轮次（防死循环）
 tool_max_errors = 3        # 连续工具错误上限（防错误风暴）
-replan_threshold = 0.6     # 信号B：step 轮次消耗比超此值触发 re-planner
+replan_threshold = 0.8     # 信号B：step 轮次消耗比超此值触发 re-planner
 replan_repeat_window = 3   # 信号C：重复检测滑动窗口大小
 
 [agent]
@@ -120,7 +120,8 @@ path = "./qdrant_db"   # mode=local 时有效
 host = "localhost"     # mode=server 时有效
 port = 6333
 
-# Redis 向量索引配置（复用 [redis] 连接，需 RedisStack / Redis 7.2+）
-[memory.redis_vector]
-index_name = "naga_memories"
-vector_dim = 1536
+# Redis 向量索引配置已废弃（项目已迁移至 SQLite + ChromaDB）
+# 如需使用 Redis 作为向量后端，请取消注释并配置
+# [memory.redis_vector]
+# index_name = "naga_memories"
+# vector_dim = 1536

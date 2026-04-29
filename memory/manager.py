@@ -5,7 +5,7 @@ from typing import Optional
 _CORE_CACHE_PREFIX = "naga_agent:memory:core:"
 
 
-def _build_mem0_config(memory_cfg: dict, redis_cfg: dict, api_key: str, base_url: Optional[str]):
+def _build_mem0_config(memory_cfg: dict, api_key: str, base_url: Optional[str]):
     """根据 config.toml [memory] 段构建 mem0 MemoryConfig。"""
     from mem0.configs.base import MemoryConfig, VectorStoreConfig, EmbedderConfig, LlmConfig
 
@@ -57,27 +57,6 @@ def _build_mem0_config(memory_cfg: dict, redis_cfg: dict, api_key: str, base_url
                 provider="qdrant",
                 config={"path": cfg.get("path", "./qdrant_db")},
             )
-    elif backend == "redis":
-        if not redis_cfg:
-            raise ValueError(
-                "[memory] backend = 'redis' 需要提供 Redis 连接配置（redis_cfg），"
-                "当前项目已移除 Redis 依赖，请将 backend 改为 'chroma' 或 'qdrant'。"
-            )
-        rv_cfg = memory_cfg.get("redis_vector", {})
-        vector_store = VectorStoreConfig(
-            provider="redis",
-            config={
-                "redis_url": (
-                    f"redis://:{redis_cfg.get('password', '')}@"
-                    f"{redis_cfg.get('host', 'localhost')}:{redis_cfg.get('port', 6379)}"
-                    f"/{redis_cfg.get('db', 0)}"
-                    if redis_cfg.get("password")
-                    else f"redis://{redis_cfg.get('host', 'localhost')}:{redis_cfg.get('port', 6379)}/{redis_cfg.get('db', 0)}"
-                ),
-                "index_name": rv_cfg.get("index_name", "naga_memories"),
-                "embedding_model_dims": rv_cfg.get("vector_dim", 1536),
-            },
-        )
     else:
         # 默认 chroma
         cfg = memory_cfg.get("chroma", {})
@@ -109,7 +88,7 @@ class MemoryManager:
                        持久存于向量库（metadata layer=episodic）。
     """
 
-    def __init__(self, memory_cfg: dict, redis_cfg: Optional[dict] = None, api_key: str = "", base_url: Optional[str] = None, storage=None):
+    def __init__(self, memory_cfg: dict, api_key: str = "", base_url: Optional[str] = None, storage=None):
         self._cfg = memory_cfg
         self._storage = storage  # SQLiteSessionManager 实例，Layer1 持久化真相来源
         # Layer1 核心记忆的进程内缓存 {key: value}
@@ -120,7 +99,7 @@ class MemoryManager:
         # 初始化 mem0
         try:
             from mem0 import Memory
-            config = _build_mem0_config(memory_cfg, redis_cfg or {}, api_key, base_url)
+            config = _build_mem0_config(memory_cfg, api_key, base_url)
             self._mem0 = Memory(config=config)
         except Exception as e:
             print(f"[MemoryManager] 警告：mem0 初始化失败，向量语义检索不可用（精确查找仍正常）。错误：{e}")

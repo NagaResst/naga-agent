@@ -198,9 +198,10 @@ class SessionManager:
         conn.execute("DELETE FROM memories WHERE key = ?", (key,))
         conn.commit()
 
-    # ── Redis 客户端透传（兼容接口，始终返回 None）──────────────────────
+    # ── 关闭连接 ──────────────────────────────────────────────────────
 
-    @property
-    def redis_client(self):
-        """保持接口兼容，SQLite 模式下返回 None。调用方需处理 None。"""
-        return None
+    def close(self):
+        """关闭当前线程的数据库连接。"""
+        if hasattr(self._local, "conn") and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None

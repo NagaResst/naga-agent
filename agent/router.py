@@ -45,7 +45,7 @@ _CLASSIFIER_SYSTEM = (
 class ModelRouter:
     _CACHE_TTL = 7 * 24 * 3600          # 路由分类缓存 7 天（进程内）
 
-    def __init__(self, routing_config: dict, redis_client=None, default_model: str = ""):
+    def __init__(self, routing_config: dict, default_model: str = ""):
         self._cfg = routing_config
         self._tier_to_model: dict = routing_config.get("tier_to_model", {})
         self._model_map: dict = routing_config.get("model_map", {

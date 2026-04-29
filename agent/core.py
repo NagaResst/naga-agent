@@ -593,7 +593,7 @@ class Agent:
                 )
                 if triggered and step_desc:
                     self.console.print(f"[dim yellow]Re-planner 触发（{reason}）[/dim yellow]")
-                    recent_summary = "\n".join(recent_tool_lines[-replan_repeat_window:])
+                    recent_summary = "\n".join(recent_tool_lines)
                     decision = self._replan_node(step_desc, recent_summary, low_model)
                     self.console.print(f"[dim]Re-planner 决策：{decision}[/dim]")
                     if decision == "skip":
