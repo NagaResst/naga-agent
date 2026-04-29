@@ -100,8 +100,7 @@ llm_model = "qwen3.6-flash"
 [memory.embedder]
 # 嵌入模型供应商：openai / ollama
 provider = "openai"
-model = "text-embedding-v2"   # DashScope 兼容模型，维度 1536，与 text-embedding-3-small 相同
-# 留空则继承 [model].base_url
+model = "tongyi-embedding-vision-flash-2026-03-06"  
 base_url = ""
 
 # Chroma 配置（内嵌或独立部署二选一）

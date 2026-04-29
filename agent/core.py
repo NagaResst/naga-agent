@@ -253,14 +253,43 @@ class Agent:
             {"role": "system", "content": self._PLAN_SYSTEM},
             {"role": "user", "content": user_input},
         ]
+        show_thinking = self.config["agent"].get("show_thinking", True)
+        plan_text = ""
         try:
-            resp = self._client.chat.completions.create(
+            extra_body = self._build_extra_body(model)
+            kwargs = dict(
                 model=model,
                 messages=plan_messages,
                 temperature=0.3,
-                stream=False,
+                stream=True,
             )
-            plan_text = resp.choices[0].message.content.strip()
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
+            stream = self._client.chat.completions.create(**kwargs)
+            in_reasoning = False
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    if not in_reasoning:
+                        if show_thinking:
+                            self.console.print("\n[dim italic]规划思考中...[/dim italic]")
+                        in_reasoning = True
+                    if show_thinking:
+                        self.console.print(f"[dim]{rc}[/dim]", end="")
+
+                if delta.content:
+                    if in_reasoning:
+                        if show_thinking:
+                            self.console.print()
+                        in_reasoning = False
+                    plan_text += delta.content
+
+            plan_text = plan_text.strip()
         except Exception as e:
             plan_text = f"[ ] Step 1: 完成用户任务：{user_input}"
             self.console.print(f"[dim yellow]规划阶段异常（{e}），使用默认单步计划[/dim yellow]")
@@ -357,8 +386,11 @@ class Agent:
 
     def _replan_node(self, step_desc: str, recent_tool_summary: str, low_model: str) -> str:
         """Re-planner：走低价模型，返回 continue / skip / abort。"""
+        show_thinking = self.config["agent"].get("show_thinking", True)
+        decision = ""
         try:
-            resp = self._client.chat.completions.create(
+            extra_body = self._build_extra_body(low_model)
+            kwargs = dict(
                 model=low_model,
                 messages=[
                     {"role": "system", "content": self._REPLAN_SYSTEM},
@@ -366,9 +398,35 @@ class Agent:
                 ],
                 temperature=0.0,
                 max_tokens=10,
-                stream=False,
+                stream=True,
             )
-            decision = resp.choices[0].message.content.strip().lower()
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
+            stream = self._client.chat.completions.create(**kwargs)
+            in_reasoning = False
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    if not in_reasoning:
+                        if show_thinking:
+                            self.console.print("\n[dim italic]重规划思考中...[/dim italic]")
+                        in_reasoning = True
+                    if show_thinking:
+                        self.console.print(f"[dim]{rc}[/dim]", end="")
+
+                if delta.content:
+                    if in_reasoning:
+                        if show_thinking:
+                            self.console.print()
+                        in_reasoning = False
+                    decision += delta.content
+
+            decision = decision.strip().lower()
         except Exception:
             decision = "continue"
 
