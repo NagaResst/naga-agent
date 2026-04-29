@@ -41,7 +41,11 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def discover_skills(skills_dir: str, enabled_names: list) -> list:
-    """扫描 skills/ 目录下所有 .md 文件，返回 skill 列表。
+    """扫描 skills/ 目录下所有 .md 文件及子目录 skill，返回 skill 列表。
+
+    支持两种 skill 形式：
+      - 单文件：skills/my-skill.md
+      - 目录：skills/my-skill/SKILL.md（含 scripts/、references/ 等子资源）
 
     enabled_names：来自 config["skills"]["enabled"]。
       - 若非空列表：名单内的 skill 强制 enabled=True，其余 False
@@ -56,11 +60,23 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
     skills = []
     use_override = bool(enabled_names)
 
-    for filename in sorted(os.listdir(skills_dir)):
-        if not filename.endswith(".md"):
+    for entry in sorted(os.listdir(skills_dir)):
+        entry_path = os.path.join(skills_dir, entry)
+
+        # 单文件 skill
+        if entry.endswith(".md") and os.path.isfile(entry_path):
+            filepath = entry_path
+            default_name = entry[:-3]
+        # 目录 skill：目录内必须有 SKILL.md
+        elif os.path.isdir(entry_path):
+            skill_md = os.path.join(entry_path, "SKILL.md")
+            if not os.path.isfile(skill_md):
+                continue
+            filepath = skill_md
+            default_name = entry
+        else:
             continue
 
-        filepath = os.path.join(skills_dir, filename)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -70,8 +86,8 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
 
         meta, body = _parse_frontmatter(content)
 
-        # name 优先用 frontmatter，回退到文件名（去掉 .md）
-        name = meta.get("name", filename[:-3])
+        # name 优先用 frontmatter，回退到文件名/目录名
+        name = meta.get("name", default_name)
         description = meta.get("description", "")
 
         if use_override:

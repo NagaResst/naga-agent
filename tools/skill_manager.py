@@ -1,6 +1,8 @@
 import os
 import shutil
 
+from agent.skill_registry import _parse_frontmatter
+
 _agent = None
 
 
@@ -14,9 +16,9 @@ TOOL_DEFINITION = {
     "function": {
         "name": "skill_manager",
         "description": (
-            "管理 Agent 的 Skill（专项能力提示词）。支持从外部路径加载 skill 文件、移除已有 skill、重新扫描 skills/ 目录。\n"
+            "管理 Agent 的 Skill（专项能力提示词）。支持从外部路径加载 skill 文件或目录、移除已有 skill、重新扫描 skills/ 目录。\n"
             "action 说明：\n"
-            "  load   - 从指定路径复制 .md 文件到 skills/ 目录并立即生效，需提供 source_path\n"
+            "  load   - 从指定路径复制 .md 文件或 skill 目录（含 SKILL.md）到 skills/ 目录，导入后自动激活，需提供 source_path\n"
             "  remove - 从 skills/ 目录删除指定名称的 skill 并立即生效，需提供 name\n"
             "  reload - 重新扫描 skills/ 目录，刷新 skill 列表"
         ),
@@ -58,20 +60,52 @@ def execute(args: dict) -> str:
         if not os.path.isabs(source_path):
             source_path = os.path.abspath(source_path)
 
-        if not os.path.isfile(source_path):
-            return f"错误：文件不存在：{source_path}"
-        if not source_path.endswith(".md"):
-            return f"错误：只支持 .md 格式的 skill 文件，当前文件：{source_path}"
+        is_dir = os.path.isdir(source_path)
+        is_file = os.path.isfile(source_path)
 
-        filename = os.path.basename(source_path)
-        dest_path = os.path.join(_agent._skills_dir, filename)
-        overwritten = os.path.isfile(dest_path)
+        if not is_dir and not is_file:
+            return f"错误：路径不存在：{source_path}"
+        if is_file and not source_path.endswith(".md"):
+            return f"错误：只支持 .md 格式的 skill 文件或 skill 目录，当前文件：{source_path}"
 
         os.makedirs(_agent._skills_dir, exist_ok=True)
-        shutil.copy2(source_path, dest_path)
+
+        if is_dir:
+            skill_md = os.path.join(source_path, "SKILL.md")
+            if not os.path.isfile(skill_md):
+                return f"错误：目录中未找到 SKILL.md：{source_path}"
+            dirname = os.path.basename(source_path.rstrip("/"))
+            dest_path = os.path.join(_agent._skills_dir, dirname)
+            overwritten = os.path.isdir(dest_path)
+            if overwritten:
+                shutil.rmtree(dest_path)
+            shutil.copytree(source_path, dest_path)
+            # 从 SKILL.md frontmatter 读取 skill name
+            try:
+                with open(skill_md, "r", encoding="utf-8") as f:
+                    content = f.read()
+                meta, _ = _parse_frontmatter(content)
+                skill_name = meta.get("name", dirname)
+            except Exception:
+                skill_name = dirname
+        else:
+            filename = os.path.basename(source_path)
+            dest_path = os.path.join(_agent._skills_dir, filename)
+            overwritten = os.path.isfile(dest_path)
+            shutil.copy2(source_path, dest_path)
+            try:
+                with open(dest_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                meta, _ = _parse_frontmatter(content)
+                skill_name = meta.get("name", filename[:-3])
+            except Exception:
+                skill_name = filename[:-3]
+
+        # 自动激活：加入 enabled_names 后 reload
+        if skill_name not in _agent._skills_enabled_names:
+            _agent._skills_enabled_names.append(skill_name)
         _agent.reload_skills()
 
-        skill_name = filename[:-3]
         active = [s["name"] for s in _agent._skills if s["enabled"]]
         action_word = "已覆盖更新" if overwritten else "已加载"
         return (
@@ -84,12 +118,26 @@ def execute(args: dict) -> str:
         if not name:
             return "错误：remove 动作需要提供 name 参数。"
 
-        target = os.path.join(_agent._skills_dir, f"{name}.md")
-        if not os.path.isfile(target):
-            existing = [f[:-3] for f in os.listdir(_agent._skills_dir) if f.endswith(".md")]
-            return f"错误：未找到 skill 文件：{name}.md\n当前 skills/ 中的文件：{existing or '空'}"
+        target_file = os.path.join(_agent._skills_dir, f"{name}.md")
+        target_dir = os.path.join(_agent._skills_dir, name)
 
-        os.remove(target)
+        if os.path.isfile(target_file):
+            os.remove(target_file)
+        elif os.path.isdir(target_dir):
+            shutil.rmtree(target_dir)
+        else:
+            existing_files = [f[:-3] for f in os.listdir(_agent._skills_dir) if f.endswith(".md")]
+            existing_dirs = [
+                d for d in os.listdir(_agent._skills_dir)
+                if os.path.isdir(os.path.join(_agent._skills_dir, d))
+                and os.path.isfile(os.path.join(_agent._skills_dir, d, "SKILL.md"))
+            ]
+            existing = sorted(existing_files + existing_dirs)
+            return f"错误：未找到 skill：{name}\n当前可用的 skill：{existing or '空'}"
+
+        # 从 enabled_names 中移除
+        if name in _agent._skills_enabled_names:
+            _agent._skills_enabled_names.remove(name)
         _agent.reload_skills()
 
         active = [s["name"] for s in _agent._skills if s["enabled"]]
