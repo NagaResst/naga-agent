@@ -7,7 +7,7 @@
 - **模型无关**：连接任意 OpenAI 兼容接口（OpenAI、Anthropic、DeepSeek、Qwen、本地 Ollama 等）
 - **智能路由**：根据任务复杂度自动选择 low / medium / high 档模型，节省费用
 - **工具调用**：Shell 命令执行、文件读写编辑、脚本生成、网页搜索与抓取、记忆管理
-- **三层记忆**：Redis 核心记忆 + mem0 向量情节记忆 + 历史摘要，跨会话持久化
+- **三层记忆**：SQLite 核心记忆 + mem0 向量情节记忆 + 历史摘要，跨会话持久化，无需外部服务
 - **上下文压缩**：零 LLM 调用的机械压缩管线，自动维持 token 预算
 - **Skill 系统**：按需加载 `.md` 格式的专项能力提示词
 - **思维链支持**：透明展示模型推理过程（需模型支持）
@@ -19,7 +19,7 @@
 ### 依赖
 
 - Python 3.11+
-- Redis（本地或远程，用于会话持久化和记忆缓存）
+- SQLite（Python 标准库内置，无需额外安装）
 
 ### 安装
 
@@ -42,10 +42,7 @@ cp .env.example .env
 ```env
 OPENAI_API_KEY=sk-...          # API Key
 OPENAI_BASE_URL=               # 留空使用 OpenAI 官方，填入第三方兼容服务地址
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_DB=0
-REDIS_PASSWORD=
+BOCHA_API_KEY=                 # 博查搜索 API Key，web_search 工具使用
 ```
 
 **2. 模型与行为配置**（`config.toml`）
@@ -53,6 +50,9 @@ REDIS_PASSWORD=
 关键配置项：
 
 ```toml
+[storage]
+db_path = "naga.db"            # SQLite 数据库路径（相对于项目根目录）
+
 [model]
 default = "gpt-4o-mini"        # 默认模型
 available = ["gpt-4o-mini", "gpt-4o"]
@@ -64,8 +64,7 @@ compress_threshold = 0.60      # token 用量达上下文窗口 60% 时触发压
 tool_output_max_chars = 300    # 旧轮次工具输出最大保留字符数
 
 [memory]
-enabled = true
-backend = "chroma"             # chroma（内嵌）/ qdrant / redis
+backend = "chroma"             # chroma（内嵌）/ qdrant
 ```
 
 ### 运行
@@ -98,14 +97,15 @@ python main.py
 
 ## 分层记忆系统
 
-记忆分三层，由 mem0 + Redis + ChromaDB 共同支撑：
+记忆分三层，由 mem0 + SQLite + ChromaDB 共同支撑：
 
 ```
-Layer1  核心记忆（Redis KV）
+Layer1  核心记忆（SQLite KV）
         ──────────────────────────────────────────────
         用户的长期偏好、固定配置、身份信息。
         每轮对话开始时全量注入 system prompt。
         通过 memory 工具的 save/recall 操作显式管理。
+        进程内缓存预热，冷启动后精确查找仍可用。
 
 Layer2  情节记忆（mem0 + 向量库）
         ──────────────────────────────────────────────
@@ -113,7 +113,7 @@ Layer2  情节记忆（mem0 + 向量库）
         系统每 N 轮自动提取（可配置 extract_every_n_turns）。
         每轮根据当前话题语义检索 Top-K 条注入 system prompt。
 
-Layer3  历史摘要（Redis 字符串，只读）
+Layer3  历史摘要（SQLite 字符串，只读）
         ──────────────────────────────────────────────
         极早期对话的旧式压缩摘要（遗留兼容）。
         只读，不再写入新摘要。
@@ -127,7 +127,6 @@ Layer3  历史摘要（Redis 字符串，只读）
 | `chroma` | server | 独立部署 Chroma HTTP 服务 |
 | `qdrant` | local | 内嵌文件模式 |
 | `qdrant` | server | 独立部署 Qdrant |
-| `redis` | — | Redis Vector Search |
 
 **嵌入模型**（通过 `config.toml [memory.embedder]` 配置）：
 
@@ -146,7 +145,7 @@ Layer3  历史摘要（Redis 字符串，只读）
 | `medium` | 需要推理或知识整合 | medium |
 | `complex` | 代码生成、系统设计、深度分析 | high |
 
-分类结果缓存 7 天（Redis），相同输入不重复分类。使用 `/model <名称>` 可锁定模型跳过路由。
+分类结果进程内缓存 7 天，相同输入不重复分类。使用 `/model <名称>` 可锁定模型跳过路由。
 
 ---
 
@@ -258,8 +257,7 @@ enabled = ["ops-expert", "code-reviewer"]
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `enabled` | true | 是否启用分层记忆 |
-| `backend` | chroma | 向量库后端（chroma/qdrant/redis） |
+| `backend` | chroma | 向量库后端（chroma/qdrant） |
 | `extract_every_n_turns` | 3 | 自动提取情节记忆的间隔轮数 |
 | `episodic_top_k` | 3 | 情节记忆语义检索返回条数 |
 | `core_max_items` | 20 | 核心记忆注入 system prompt 的最大条数 |
@@ -283,9 +281,9 @@ naga-agent/
 │   ├── token_tracker.py      # tiktoken token 计数
 │   └── skill_registry.py     # Skill 扫描与加载
 ├── memory/
-│   └── manager.py            # 三层记忆管理器（mem0 + Redis）
+│   └── manager.py            # 三层记忆管理器（SQLite Layer1 + mem0 向量层）
 ├── session/
-│   └── redis_session.py      # Redis 会话持久化
+│   └── sqlite_session.py     # SQLite 会话持久化（会话、消息、记忆、摘要）
 ├── tools/                    # 工具模块（自动注册）
 │   ├── execute_command.py
 │   ├── edit_file.py
