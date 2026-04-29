@@ -415,9 +415,13 @@ class Agent:
         # 规划节点：medium / complex 任务先生成执行计划
         if complexity in ("medium", "complex"):
             steps, plan_text = self._plan_node(user_input, messages, active_model)
+            # 注入全局计划供模型参考，明确禁止提前执行未到步骤
             messages.append({
                 "role": "system",
-                "content": f"【执行计划】\n{plan_text}\n\n请严格按照上述步骤顺序完成任务。",
+                "content": (
+                    f"【完整执行计划（仅供参考）】\n{plan_text}\n\n"
+                    "重要：系统会逐步调用每个步骤，每次只执行当前被指定的步骤，不要提前执行其他步骤。"
+                ),
             })
         else:
             steps = []
@@ -617,11 +621,19 @@ class Agent:
             silent_steps = not self.config["agent"].get("show_thinking", True)
             for i, step_desc in enumerate(steps, 1):
                 self.console.print(f"\n[bold cyan]► Step {i}/{len(steps)}：[/bold cyan]{step_desc}")
+                # C+D：记录插入位置，注入含 [STEP_DONE] 协议的单步约束消息
+                step_msg_idx = len(messages)
                 messages.append({
                     "role": "system",
-                    "content": f"【当前步骤 {i}/{len(steps)}】{step_desc}",
+                    "content": (
+                        f"【执行第 {i} 步，共 {len(steps)} 步】{step_desc}\n"
+                        f"你当前只负责执行第 {i} 步。其余步骤会由系统在后续轮次单独调用，不要跨步骤执行。"
+                        "完成本步骤后立即在回复末尾输出 [STEP_DONE] 停止。"
+                    ),
                 })
                 last_content, reason = _run_tool_loop(step_desc, silent=silent_steps)
+                # C：步骤结束后移除约束消息，工具调用链保留
+                messages.pop(step_msg_idx)
                 step_contents.append(last_content)
                 self.console.print(f"[dim green]✓ Step {i} 完成[/dim green]")
                 if _task_aborted:
