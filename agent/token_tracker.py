@@ -53,7 +53,7 @@ class TokenTracker:
         return total
 
     def record_usage(self, session_manager, session_id: str, model: str, usage) -> dict:
-        """从 API 返回的 usage 对象读取真实消耗并写入 Redis。
+        """从 API 返回的 usage 对象读取真实消耗并持久化记录。
 
         usage 可以是 openai.types.CompletionUsage 对象或 dict。
         返回记录的 dict。

@@ -1,5 +1,6 @@
 import re
 import hashlib
+import time
 from typing import Optional, Tuple
 
 # 触发 complex/high 路由的关键词
@@ -42,8 +43,7 @@ _CLASSIFIER_SYSTEM = (
 
 
 class ModelRouter:
-    _CACHE_TTL = 7 * 24 * 3600          # 路由分类缓存 7 天
-    _CACHE_PREFIX = "naga_agent:route_cache:"
+    _CACHE_TTL = 7 * 24 * 3600          # 路由分类缓存 7 天（进程内）
 
     def __init__(self, routing_config: dict, redis_client=None, default_model: str = ""):
         self._cfg = routing_config
@@ -51,7 +51,8 @@ class ModelRouter:
         self._model_map: dict = routing_config.get("model_map", {
             "simple": "low", "medium": "medium", "complex": "high"
         })
-        self._redis = redis_client
+        # 进程内内存缓存：{cache_key: (label, expire_ts)}
+        self._mem_cache: dict = {}
         self._default_model = default_model
 
     def get_model_by_tier(self, tier: str) -> str:
@@ -98,10 +99,9 @@ class ModelRouter:
         return None  # 交给分类层
 
     def _cache_key(self, text: str) -> str:
-        """对标准化后的输入文本生成 Redis cache key。"""
+        """对标准化后的输入文本生成缓存 key。"""
         normalized = " ".join(text.strip().split())[:200]
-        digest = hashlib.md5(normalized.encode("utf-8")).hexdigest()
-        return self._CACHE_PREFIX + digest
+        return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
     def _classifier_route(self, user_input: str, client) -> tuple:
         """用 classifier_model 做轻量分类，返回 (model, label)。"""
@@ -127,22 +127,19 @@ class ModelRouter:
         return self.get_model_by_tier(tier), label
 
     def _cached_classify(self, user_input: str, client) -> tuple:
-        """带 Redis 缓存的分类路由，命中则跳过 API 调用。"""
-        if self._redis is not None:
-            try:
-                key = self._cache_key(user_input)
-                cached = self._redis.get(key)
-                if cached and cached in ("simple", "medium", "complex"):
-                    label = cached
-                    tier = self._model_map.get(label, "medium")
-                    return self.get_model_by_tier(tier), f"classifier:{label}(cached)"
-                # 未命中，调用 API
-                model, label = self._classifier_route(user_input, client)
-                self._redis.setex(key, self._CACHE_TTL, label)
-                return model, f"classifier:{label}"
-            except Exception:
-                pass  # Redis 异常降级
-        return self._classifier_route(user_input, client)
+        """带内存缓存的分类路由，命中则跳过 API 调用。"""
+        key = self._cache_key(user_input)
+        now = time.time()
+        cached = self._mem_cache.get(key)
+        if cached:
+            label, expire_ts = cached
+            if now < expire_ts and label in ("simple", "medium", "complex"):
+                tier = self._model_map.get(label, "medium")
+                return self.get_model_by_tier(tier), f"classifier:{label}(cached)"
+        # 未命中，调用 API
+        model, label = self._classifier_route(user_input, client)
+        self._mem_cache[key] = (label, now + self._CACHE_TTL)
+        return model, f"classifier:{label}"
 
     def route(
         self,
@@ -169,7 +166,7 @@ class ModelRouter:
             model, label = rule_result
             return model, "rule", label
 
-        # 第二层：分类模型（带 Redis 缓存）
+        # 第二层：分类模型（带进程内缓存）
         model, reason = self._cached_classify(user_input, client)
         # reason 格式："classifier:complex" / "classifier:complex(cached)"
         label = reason.split(":", 1)[-1].split("(")[0].strip()

@@ -27,7 +27,7 @@ class Agent:
         self.console = console
         self.auto_confirm = config["agent"]["auto_confirm"]
         self.max_history = config["agent"]["max_history"]
-        # 历史摘要：优先从 Redis 恢复，确保重启后上下文不丢失
+        # 历史摘要：优先从持久化存储恢复，确保重启后上下文不丢失
         self._history_summary = session_manager.get_summary(session_id)
 
         self._client = OpenAI(
@@ -36,26 +36,18 @@ class Agent:
         )
         self.tool_definitions, self.tool_executors = discover_tools()
 
-        # 注入 session_manager 到 memory 工具
-        memory_module.set_session_manager(session_manager)
-
-        # 初始化分层记忆管理器
-        self._memory_manager = None
-        if config.get("memory", {}).get("enabled", False):
-            try:
-                self._memory_manager = MemoryManager(
-                    config["memory"],
-                    config["redis"],
-                    config["api_key"],
-                    config.get("base_url"),
-                )
-                if self._memory_manager.available:
-                    memory_module.set_memory_manager(self._memory_manager)
-                    console.print("[dim]分层记忆已启用（mem0 + 向量库）[/dim]")
-                else:
-                    console.print("[dim yellow]分层记忆初始化失败，降级为 Redis KV 模式[/dim yellow]")
-            except Exception as e:
-                console.print(f"[dim yellow]分层记忆加载异常：{e}，降级为 Redis KV 模式[/dim yellow]")
+        # 初始化分层记忆管理器（必要组件，失败时向上抛出）
+        self._memory_manager = MemoryManager(
+            config["memory"],
+            api_key=config["api_key"],
+            base_url=config.get("base_url"),
+            storage=session_manager,
+        )
+        memory_module.set_memory_manager(self._memory_manager)
+        if self._memory_manager.available:
+            console.print("[dim]分层记忆已启用（SQLite 精确查找 + mem0 向量语义检索）[/dim]")
+        else:
+            console.print("[dim]分层记忆已启用（SQLite 精确查找，向量语义检索不可用）[/dim]")
 
         # 注入 search 配置到 web_search 工具
         web_search_module.set_config(config.get("search", {}))
@@ -67,10 +59,9 @@ class Agent:
                 "[dim yellow]Token 估算模式：unavailable（字符粗估，误差较大）[/dim yellow]"
             )
 
-        # 模型路由器（注入 Redis 客户端，用于路由分类结果缓存）
+        # 模型路由器（进程内缓存，无需外部依赖）
         self._router = ModelRouter(
             config.get("routing", {}),
-            redis_client=session_manager.redis_client,
             default_model=config["model"]["default"],
         )
 
@@ -102,7 +93,7 @@ class Agent:
             # 触发前先同步 mem0 提取，确保即将被压缩的内容已落入记忆
             if self._memory_manager and self._memory_manager.available:
                 self._memory_manager.add(raw_messages, layer="episodic")
-            # 纯机械压缩，只在内存中生效，不写入 Redis
+            # 纯机械压缩，只在内存中生效，不落盘
             raw_messages = summarizer.compress_pipeline(
                 raw_messages,
                 self._token_tracker,
@@ -234,44 +225,25 @@ class Agent:
         return extra if extra else None
 
     _PLAN_SYSTEM = (
-        "你是一个任务规划器。根据用户的任务，判断是否缺少关键信息，并输出对应格式：\n\n"
-        "情况一：信息充足，可以规划执行 → 输出步骤列表：\n"
+        "你是一个任务规划器。根据用户的任务，输出一个严格按照以下格式的执行计划，"
+        "不要有任何额外解释、不要执行任何操作、不要输出代码：\n\n"
         "[ ] Step 1: <具体步骤描述>\n"
         "[ ] Step 2: <具体步骤描述>\n"
         "...\n\n"
-        "情况二：缺少只有用户才能提供的关键信息 → 输出提问：\n"
-        "【需要提问】\n"
-        "- <问题1>\n"
-        "- <问题2>\n\n"
-        "判断标准：\n"
-        "- 如果缺少的信息可以通过搜索、读文件等工具自行获取，属于情况一\n"
-        "- 如果信息已足够执行至少一个有效动作（如搜索、查询），即使不完美也属于情况一，先行动再根据结果调整\n"
-        "- 只有在确实无法合理推断且没有可用起点时，才属于情况二\n"
-        "- 用户的偏好、细节需求等可在执行过程中自然发现，不必须提前追问\n\n"
-        "步骤列表要求：\n"
+        "要求：\n"
         "- 每个步骤必须是可独立执行的最小工作单元\n"
         "- 步骤数量 3~8 个，不要过于拆碎也不要合并复杂操作\n"
-        "- 只输出步骤列表或提问，不要有前言和总结"
+        "- 只输出步骤列表，不要有前言和总结"
     )
 
     def _plan_node(self, user_input: str, messages: list, model: str):
-        """规划节点：生成 checkbox 步骤列表或识别信息缺口，返回 (steps, plan_text, needs_question)。"""
+        """规划节点：生成 checkbox 步骤列表并展示，返回 (steps, plan_text)。"""
         import re as _re
         from rich.panel import Panel as RichPanel
 
-        # 检测用户是否已回答过 AI 的提问：历史中有 assistant 含【需要提问】+ 紧接 user 回复
-        _answered_hint = ""
-        for i in range(len(messages) - 1):
-            m_cur = messages[i]
-            m_next = messages[i + 1]
-            if (m_cur.get("role") == "assistant" and "【需要提问】" in m_cur.get("content", "")
-                    and m_next.get("role") == "user"):
-                _answered_hint = "\n\n注意：用户已回答过你的提问，请优先根据已有信息行动，除非仍有无法合理推断的关键信息缺失。"
-                break
-
         plan_messages = [
             {"role": "system", "content": self._PLAN_SYSTEM},
-            {"role": "user", "content": user_input + _answered_hint},
+            {"role": "user", "content": user_input},
         ]
         try:
             resp = self._client.chat.completions.create(
@@ -285,17 +257,6 @@ class Agent:
             plan_text = f"[ ] Step 1: 完成用户任务：{user_input}"
             self.console.print(f"[dim yellow]规划阶段异常（{e}），使用默认单步计划[/dim yellow]")
 
-        # 检测"需要提问"信号
-        needs_question = "【需要提问】" in plan_text
-        if needs_question:
-            self.console.print(RichPanel(
-                plan_text,
-                title="[bold yellow]需要更多信息[/bold yellow]",
-                border_style="yellow",
-                padding=(0, 1),
-            ))
-            return [], plan_text, True
-
         self.console.print(RichPanel(
             plan_text,
             title="[bold cyan]执行计划[/bold cyan]",
@@ -307,7 +268,7 @@ class Agent:
         steps = _re.findall(r'\[ \]\s*Step\s*\d+:\s*(.+)', plan_text)
         if not steps:
             steps = [line.strip() for line in plan_text.splitlines() if line.strip()]
-        return steps, plan_text, False
+        return steps, plan_text
 
     _SUMMARIZE_SYSTEM = (
         "你是一个结果整理助手。以下是按步骤执行任务时每一步的输出，"
@@ -453,12 +414,7 @@ class Agent:
 
         # 规划节点：medium / complex 任务先生成执行计划
         if complexity in ("medium", "complex"):
-            steps, plan_text, needs_question = self._plan_node(user_input, messages, active_model)
-            if needs_question:
-                # 信息不足，直接返回提问内容，跳过工具循环
-                question_text = plan_text.replace("【需要提问】", "").strip()
-                self.session_manager.append_message(self.session_id, "assistant", question_text)
-                return question_text
+            steps, plan_text = self._plan_node(user_input, messages, active_model)
             messages.append({
                 "role": "system",
                 "content": f"【执行计划】\n{plan_text}\n\n请严格按照上述步骤顺序完成任务。",

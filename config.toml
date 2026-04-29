@@ -1,8 +1,5 @@
-[redis]
-host = "localhost"
-port = 6379
-db = 0
-password = ""
+[storage]
+db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
 default = "qwen3.6-flash"
@@ -87,8 +84,7 @@ enabled = []
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
-enabled = true
-# 向量库后端：chroma（默认，内嵌）/ qdrant / redis
+# 向量库后端：chroma（默认，内嵌）/ qdrant
 backend = "chroma"
 # 每 N 轮对话后触发一次记忆提取；0 = 仅会话结束时触发
 extract_every_n_turns = 3

@@ -18,7 +18,12 @@ def load_config() -> dict:
         with open(config_path, "rb") as f:
             toml_config = tomllib.load(f)
 
-    redis_section = toml_config.get("redis", {})
+    storage_section = toml_config.get("storage", {})
+    db_path_default = os.path.join(os.path.dirname(os.path.dirname(__file__)), "naga.db")
+    db_path = os.environ.get("NAGA_DB_PATH", storage_section.get("db_path", db_path_default))
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), db_path)
+
     model_section = toml_config.get("model", {})
     agent_section = toml_config.get("agent", {})
 
@@ -27,11 +32,6 @@ def load_config() -> dict:
         print("警告：未设置 OPENAI_API_KEY 环境变量，请在 .env 文件或环境变量中配置。")
 
     base_url = os.environ.get("OPENAI_BASE_URL") or model_section.get("base_url", "") or None
-
-    redis_host = os.environ.get("REDIS_HOST", redis_section.get("host", "localhost"))
-    redis_port = int(os.environ.get("REDIS_PORT", redis_section.get("port", 6379)))
-    redis_db = int(os.environ.get("REDIS_DB", redis_section.get("db", 0)))
-    redis_password = os.environ.get("REDIS_PASSWORD", redis_section.get("password", "")) or None
 
     project_root = os.path.dirname(os.path.dirname(__file__))
 
@@ -86,11 +86,8 @@ def load_config() -> dict:
     return {
         "api_key": api_key,
         "base_url": base_url,
-        "redis": {
-            "host": redis_host,
-            "port": redis_port,
-            "db": redis_db,
-            "password": redis_password,
+        "storage": {
+            "db_path": db_path,
         },
         "model": {
             "default": model_section.get("default", "gpt-4o-mini"),

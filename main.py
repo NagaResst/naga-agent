@@ -12,7 +12,7 @@ from prompt_toolkit.formatted_text import ANSI
 
 from agent.config import load_config
 from agent.core import Agent
-from session.redis_session import SessionManager
+from session.sqlite_session import SessionManager
 
 
 HELP_TEXT = """
@@ -104,15 +104,22 @@ def main():
     config = load_config()
 
     try:
-        session_manager = SessionManager(config["redis"])
-    except ConnectionError as e:
-        console.print(f"[bold red]{e}[/bold red]")
+        session_manager = SessionManager(config["storage"]["db_path"])
+    except Exception as e:
+        console.print(f"[bold red]会话数据库初始化失败，无法启动：{e}[/bold red]")
+        console.print(f"[dim]数据库路径：{config['storage']['db_path']}[/dim]")
+        console.print("[dim]请确认该路径所在目录存在且有写入权限。[/dim]")
         sys.exit(1)
 
     model = config["model"]["default"]
     session_id = select_session(console, session_manager)
 
-    agent = Agent(config, session_manager, session_id, model, console)
+    try:
+        agent = Agent(config, session_manager, session_id, model, console)
+    except Exception as e:
+        console.print(f"[bold red]记忆系统初始化失败，无法启动：{e}[/bold red]")
+        console.print("[dim]请检查 config.toml 中 [memory] 配置，以及嵌入模型 API key 和 base_url 是否正确。[/dim]")
+        sys.exit(1)
     prompt_prefix = config["agent"].get("prompt_prefix", "🤖")
     is_new_session = session_manager.get_history(session_id) == []
 
