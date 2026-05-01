@@ -1,37 +1,34 @@
+import os
 import threading
 from typing import Optional
+
+# 禁用 mem0 遥测（避免 atexit 时 posthog 关闭报错）
+os.environ["MEM0_TELEMETRY"] = "False"
 
 # 保留常量，仅用于向量库 metadata 查询时的前缀标识（不再用于 Redis）
 _CORE_CACHE_PREFIX = "naga_agent:memory:core:"
 
 
 def _build_mem0_config(memory_cfg: dict, api_key: str, base_url: Optional[str]):
-    """根据 config.toml [memory] 段构建 mem0 MemoryConfig。"""
+    """根据 config.toml [memory] 段构建 mem0 MemoryConfig。
+
+    统一使用 Qdrant server + 本地 bge-base-zh-v1.5 Daemon 嵌入（768 维）。
+    mem0 集合名 "mem0"，手动记忆集合名 "memories"，两者共存于同一 Qdrant 实例。
+    """
     from mem0.configs.base import MemoryConfig, VectorStoreConfig, EmbedderConfig, LlmConfig
 
-    backend = memory_cfg.get("backend", "chroma")
     embedder_cfg = memory_cfg.get("embedder", {})
-    embedder_base_url = embedder_cfg.get("base_url", "") or base_url or None
+    embedder_base_url = embedder_cfg.get("base_url", "http://127.0.0.1:8000/v1")
 
-    # 嵌入模型配置
-    embedder_provider = embedder_cfg.get("provider", "openai")
-    if embedder_provider == "ollama":
-        embedder = EmbedderConfig(
-            provider="ollama",
-            config={
-                "model": embedder_cfg.get("model", "nomic-embed-text"),
-                "ollama_base_url": embedder_base_url or "http://localhost:11434",
-            },
-        )
-    else:
-        embedder = EmbedderConfig(
-            provider="openai",
-            config={
-                "model": embedder_cfg.get("model", "text-embedding-3-small"),
-                "api_key": api_key,
-                **({"openai_base_url": embedder_base_url} if embedder_base_url else {}),
-            },
-        )
+    # 嵌入模型：统一走本地 Daemon 的 OpenAI 兼容接口（bge-base-zh-v1.5, 768 维）
+    embedder = EmbedderConfig(
+        provider="openai",
+        config={
+            "model": embedder_cfg.get("model", "bge-base-zh-v1.5"),
+            "api_key": embedder_cfg.get("api_key", "daemon"),
+            "openai_base_url": embedder_base_url,
+        },
+    )
 
     # LLM 配置（mem0 内部提取记忆时使用，复用主模型接入点）
     llm_model = memory_cfg.get("llm_model", "qwen3.6-flash")
@@ -44,32 +41,18 @@ def _build_mem0_config(memory_cfg: dict, api_key: str, base_url: Optional[str]):
         },
     )
 
-    # 向量库配置
-    if backend == "qdrant":
-        cfg = memory_cfg.get("qdrant", {})
-        if cfg.get("mode", "local") == "server":
-            vector_store = VectorStoreConfig(
-                provider="qdrant",
-                config={"host": cfg.get("host", "localhost"), "port": cfg.get("port", 6333)},
-            )
-        else:
-            vector_store = VectorStoreConfig(
-                provider="qdrant",
-                config={"path": cfg.get("path", "./qdrant_db")},
-            )
-    else:
-        # 默认 chroma
-        cfg = memory_cfg.get("chroma", {})
-        if cfg.get("mode", "local") == "server":
-            vector_store = VectorStoreConfig(
-                provider="chroma",
-                config={"host": cfg.get("host", "localhost"), "port": cfg.get("port", 8000)},
-            )
-        else:
-            vector_store = VectorStoreConfig(
-                provider="chroma",
-                config={"path": cfg.get("path", "./chroma_db")},
-            )
+    # 向量库：统一 Qdrant server 模式
+    cfg = memory_cfg.get("qdrant", {})
+    qdrant_config = {
+        "host": cfg.get("host", "localhost"),
+        "port": cfg.get("port", 6333),
+        "collection_name": "mem0",
+        "embedding_model_dims": 768,  # bge-base-zh-v1.5 维度，默认 1536 会导致维度不匹配
+    }
+    vector_store = VectorStoreConfig(
+        provider="qdrant",
+        config=qdrant_config,
+    )
 
     return MemoryConfig(
         vector_store=vector_store,

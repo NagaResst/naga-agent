@@ -84,8 +84,8 @@ enabled = []
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
-# 向量库后端：chroma（默认，内嵌）/ qdrant
-backend = "chroma"
+# 向量库后端：统一使用 Qdrant server
+backend = "qdrant"
 # 每 N 轮对话后触发一次记忆提取；0 = 仅会话结束时触发
 extract_every_n_turns = 3
 # 触发提取的最小内容字符数（避免短消息浪费）
@@ -98,29 +98,21 @@ core_max_items = 20
 llm_model = "qwen3.6-flash"
 
 [memory.embedder]
-# 嵌入模型供应商：openai / ollama
-provider = "openai"
-model = "tongyi-embedding-vision-flash-2026-03-06"  
-base_url = ""
+# 嵌入模型：通过本地 Daemon 的 OpenAI 兼容接口（bge-base-zh-v1.5, 768 维）
+model = "bge-base-zh-v1.5"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "daemon"
 
-# Chroma 配置（内嵌或独立部署二选一）
-[memory.chroma]
-# mode: local（内嵌，无需独立服务）/ server（独立部署）
-mode = "local"
-path = "./chroma_db"   # mode=local 时有效
-host = "localhost"     # mode=server 时有效
-port = 8000
-
-# Qdrant 配置（内嵌或独立部署二选一）
+# Qdrant server 配置（mem0 集合="mem0"，手动记忆集合="memories"）
 [memory.qdrant]
-# mode: local（内嵌文件）/ server（独立部署）
-mode = "local"
-path = "./qdrant_db"   # mode=local 时有效
-host = "localhost"     # mode=server 时有效
+host = "localhost"
 port = 6333
 
-# Redis 向量索引配置已废弃（项目已迁移至 SQLite + ChromaDB）
-# 如需使用 Redis 作为向量后端，请取消注释并配置
-# [memory.redis_vector]
-# index_name = "naga_memories"
-# vector_dim = 1536
+# ── 本地嵌入 Daemon ─────────────────────────────────────────────────────────
+[embedding_daemon]
+# Daemon 脚本路径（启动时自动 fork 子进程）
+script_path = "scripts/vector_daemon.py"
+host = "127.0.0.1"
+port = 8000
+# CPU 计算线程数（0 = 自动检测全部核心，默认 PyTorch 只用一半）
+cpu_threads = 0

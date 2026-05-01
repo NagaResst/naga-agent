@@ -75,13 +75,7 @@ def load_config() -> dict:
 
     skills_section = toml_config.get("skills", {})
 
-    memory_section = toml_config.get("memory", {})
-    # embedder base_url 为空时继承顶层 base_url
-    embedder_cfg = dict(memory_section.get("embedder", {}))
-    if not embedder_cfg.get("base_url"):
-        embedder_cfg["base_url"] = base_url or ""
     memory_section = dict(memory_section)
-    memory_section["embedder"] = embedder_cfg
 
     return {
         "api_key": api_key,
@@ -137,4 +131,5 @@ def load_config() -> dict:
             "enabled": skills_section.get("enabled", []),
         },
         "memory": memory_section,
+        "embedding_daemon": toml_config.get("embedding_daemon", {}),
     }

@@ -1,4 +1,9 @@
 import json
+import atexit
+import subprocess
+import sys
+import threading
+import time
 
 from openai import OpenAI
 
@@ -36,6 +41,78 @@ class Agent:
         )
         self.tool_definitions, self.tool_executors = discover_tools()
 
+        # 启动语义引擎子进程（mem0 和手动记忆共用 bge-base-zh-v1.5）
+        self._daemon_proc = None
+        daemon_cfg = config.get("embedding_daemon", {})
+        daemon_script = daemon_cfg.get("script_path", "")
+        # 支持相对路径：相对于项目根目录解析
+        if daemon_script and not os.path.isabs(daemon_script):
+            _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            daemon_script = os.path.join(_project_root, daemon_script)
+        if daemon_script and os.path.isfile(daemon_script):
+            daemon_host = daemon_cfg.get("host", "127.0.0.1")
+            daemon_port = daemon_cfg.get("port", 8000)
+            try:
+                # PYTHONUNBUFFERED=1 确保 Python 子进程输出不缓冲，实时可见
+                env = os.environ.copy()
+                env["PYTHONUNBUFFERED"] = "1"
+                self._daemon_proc = subprocess.Popen(
+                    [sys.executable, daemon_script, "--host", daemon_host, "--port", str(daemon_port),
+                     "--cpu-threads", str(daemon_cfg.get("cpu_threads", 0))],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=env,
+                )
+                # 后台线程：将语义引擎的 stdout 转发到控制台
+                def _stream_daemon_output(proc):
+                    try:
+                        for line in iter(proc.stdout.readline, b""):
+                            text = line.decode(errors="replace").rstrip()
+                            if text:
+                                console.print(f"[dim][语义引擎] {text}[/dim]")
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_stream_daemon_output, args=(self._daemon_proc,), daemon=True).start()
+
+                # 等待语义引擎就绪（无硬性超时，首次运行下载模型可能需要数分钟）
+                import requests as _req
+                daemon_url = f"http://{daemon_host}:{daemon_port}"
+                console.print("[dim]语义引擎正在初始化（首次运行可能需要下载模型，请耐心等待）…[/dim]")
+                console.print("[dim]按 Ctrl+C 可跳过等待（语义引擎将在后台继续下载）[/dim]")
+                wait_count = 0
+                try:
+                    while True:
+                        # 检查进程是否已退出
+                        if self._daemon_proc.poll() is not None:
+                            console.print(f"[dim yellow]语义引擎进程异常退出（返回码 {self._daemon_proc.returncode}），向量功能不可用[/dim yellow]")
+                            self._daemon_proc = None
+                            break
+                        try:
+                            resp = _req.get(f"{daemon_url}/health", timeout=1)
+                            # 验证：我们的进程仍在运行（防止命中旧实例）
+                            if self._daemon_proc.poll() is not None:
+                                console.print("[dim yellow]语义引擎进程已退出（health 命中的是旧实例），向量功能不可用[/dim yellow]")
+                                self._daemon_proc = None
+                                break
+                            console.print(f"[dim]语义引擎已就绪 (PID {self._daemon_proc.pid}, {daemon_url})[/dim]")
+                            # 主进程退出时自动关闭语义引擎子进程
+                            atexit.register(self._cleanup_daemon)
+                            break
+                        except Exception:
+                            time.sleep(2)
+                            wait_count += 1
+                            if wait_count % 5 == 0:
+                                console.print(f"[dim]仍在等待语义引擎就绪…（已等待 {wait_count * 2}s）[/dim]")
+                except KeyboardInterrupt:
+                    console.print("\n[dim yellow]已跳过等待，语义引擎将在后台继续初始化。[/dim yellow]")
+                    console.print(f"[dim yellow]模型下载完成后，下次启动将立即可用。[/dim yellow]")
+                    atexit.register(self._cleanup_daemon)
+            except Exception as e:
+                console.print(f"[dim yellow]语义引擎启动失败：{e}，向量功能可能不可用[/dim yellow]")
+        else:
+            if daemon_script:
+                console.print(f"[dim yellow]语义引擎脚本不存在：{daemon_script}[/dim yellow]")
+
         # 初始化分层记忆管理器（必要组件，失败时向上抛出）
         self._memory_manager = MemoryManager(
             config["memory"],
@@ -44,6 +121,15 @@ class Agent:
             storage=session_manager,
         )
         memory_module.set_memory_manager(self._memory_manager)
+        # 注入配置到手动记忆模块
+        import tools.manual_memory as manual_memory_module
+        daemon_cfg = config.get("embedding_daemon", {})
+        qdrant_cfg = config.get("memory", {}).get("qdrant", {})
+        manual_memory_module.configure(
+            qdrant_host=qdrant_cfg.get("host", "localhost"),
+            qdrant_port=qdrant_cfg.get("port", 6333),
+            daemon_url=f"http://{daemon_cfg.get('host', '127.0.0.1')}:{daemon_cfg.get('port', 8000)}",
+        )
         if self._memory_manager.available:
             console.print("[dim]分层记忆已启用（SQLite 精确查找 + mem0 向量语义检索）[/dim]")
         else:
@@ -77,6 +163,14 @@ class Agent:
         # 注入 agent 引用到 skill_manager 工具
         import tools.skill_manager as skill_manager_module
         skill_manager_module.set_agent(self)
+
+    def _cleanup_daemon(self):
+        """主进程退出时终止语义引擎子进程。"""
+        if self._daemon_proc and self._daemon_proc.poll() is None:
+            try:
+                self._daemon_proc.kill()  # SIGKILL 立即终止，不等待
+            except Exception:
+                pass
 
     def reload_skills(self):
         """重新扫描 skills/ 目录，热更新已加载的 skill 列表。"""
@@ -154,7 +248,17 @@ class Agent:
 
         # 激活的 skill prompt 追加在最末尾
         skill_block = "\n\n".join(s["prompt"] for s in self._skills if s["enabled"])
-        system_prompt = base_prompt + memory_block + episodic_block + summary_block
+
+        # 双记忆源描述：告知 Agent 有两种记忆来源
+        dual_memory_desc = (
+            "\n\n【记忆系统说明】\n"
+            "你有两种记忆来源：\n"
+            "1. 对话记忆（自动）：从对话中自动提取的用户偏好和情节记忆。\n"
+            "2. 手动知识库（手动）：用户主动导入的文档知识，存储在 memories 集合中，支持按标题或来源删除。\n"
+            "使用 memory 工具的 search 操作可同时检索两个来源；add_document 用于导入文档；forget 用于删除记忆。"
+        )
+
+        system_prompt = base_prompt + memory_block + episodic_block + summary_block + dual_memory_desc
         if skill_block:
             system_prompt += "\n\n" + skill_block
         if system_prompt.strip():
