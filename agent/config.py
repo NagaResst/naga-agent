@@ -60,11 +60,10 @@ def load_config() -> dict:
         tier_to_model[tier] = m
 
     extra_params = model_section.get("extra_params", {})
+    extra_params_default = dict(model_section.get("extra_params_default", {}))
 
     routing_section = toml_config.get("routing", {})
     routing_map = routing_section.get("model_map", {"simple": "low", "medium": "medium", "complex": "high"})
-
-    pricing_section = toml_config.get("pricing", {})
 
     tools_section = toml_config.get("tools", {})
 
@@ -75,7 +74,7 @@ def load_config() -> dict:
 
     skills_section = toml_config.get("skills", {})
 
-    memory_section = dict(memory_section)
+    memory_section = dict(toml_config.get("memory", {}))
 
     return {
         "api_key": api_key,
@@ -89,6 +88,7 @@ def load_config() -> dict:
             "tiers": model_to_tier,
             "tier_to_model": tier_to_model,
             "extra_params": extra_params,
+            "extra_params_default": extra_params_default,
         },
         "routing": {
             "enabled": routing_section.get("enabled", False),
@@ -97,7 +97,6 @@ def load_config() -> dict:
             "model_map": routing_map,
             "tier_to_model": tier_to_model,
         },
-        "pricing": pricing_section,
         "tools": {
             "command_timeout": tools_section.get("command_timeout", 30),
             "output_max_chars": tools_section.get("output_max_chars", 3000),

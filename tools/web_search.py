@@ -6,7 +6,7 @@ except ImportError:
     _requests = None
 
 try:
-    from duckduckgo_search import DDGS as _DDGS
+    from ddgs import DDGS as _DDGS
 except ImportError:
     _DDGS = None
 

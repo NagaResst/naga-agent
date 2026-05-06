@@ -164,6 +164,9 @@ class Agent:
         import tools.skill_manager as skill_manager_module
         skill_manager_module.set_agent(self)
 
+        # 会话主题追踪（内联标签方式，每轮从主模型回复中提取，零额外 API 调用）
+        self._session_theme: str = ""
+
     def _cleanup_daemon(self):
         """主进程退出时终止语义引擎子进程。"""
         if self._daemon_proc and self._daemon_proc.poll() is None:
@@ -224,6 +227,16 @@ class Agent:
         if first_user:
             anchor = first_user[:100] + ("..." if len(first_user) > 100 else "")
             base_prompt += f"\n\n【本次会话起点】\n{anchor}"
+
+        # 会话主题（内联标签：要求模型每次回复开头输出 <theme> 标签，流式接收时静默提取后剥离）
+        _theme_instr = (
+            "\n\n【主题标签协议】\n"
+            "每次回复的**最开头**先输出 `<theme>主题关键词(10字以内)</theme>` 然后换行，"
+            "再输出正文。不要解释标签。示例：`<theme>K8s集群运维</theme>`"
+        )
+        base_prompt += _theme_instr
+        if self._session_theme:
+            base_prompt += f"\n\n【当前会话主题】\n{self._session_theme}"
 
         # Layer1 核心记忆
         if self._memory_manager and self._memory_manager.available:
@@ -332,9 +345,21 @@ class Agent:
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
+    # OpenAI 顶层参数（不能放进 extra_body，需直接注入 kwargs）
+    _OPENAI_TOP_LEVEL_PARAMS = frozenset({"reasoning_effort", "max_completion_tokens"})
+
     def _build_extra_body(self, model: str):
-        extra = dict(self.config["model"].get("extra_params", {}).get(model, {}))
-        return extra if extra else None
+        """返回 (extra_body, top_level_params) 两个 dict（均可能为 None）。
+
+        - extra_body: Qwen enable_thinking 等供应商扩展参数
+        - top_level_params: OpenAI reasoning_effort 等顶层参数
+        """
+        default = dict(self.config["model"].get("extra_params_default", {}))
+        model_specific = dict(self.config["model"].get("extra_params", {}).get(model, {}))
+        merged = {**default, **model_specific}
+        top_level = {k: v for k, v in merged.items() if k in self._OPENAI_TOP_LEVEL_PARAMS}
+        extra_body = {k: v for k, v in merged.items() if k not in self._OPENAI_TOP_LEVEL_PARAMS}
+        return (extra_body or None), (top_level or None)
 
     _PLAN_SYSTEM = (
         "你是一个任务规划器。根据用户的任务，输出一个严格按照以下格式的执行计划，"
@@ -360,7 +385,7 @@ class Agent:
         show_thinking = self.config["agent"].get("show_thinking", True)
         plan_text = ""
         try:
-            extra_body = self._build_extra_body(model)
+            extra_body, top_level_params = self._build_extra_body(model)
             kwargs = dict(
                 model=model,
                 messages=plan_messages,
@@ -369,6 +394,8 @@ class Agent:
             )
             if extra_body:
                 kwargs["extra_body"] = extra_body
+            if top_level_params:
+                kwargs.update(top_level_params)
 
             stream = self._client.chat.completions.create(**kwargs)
             in_reasoning = False
@@ -493,7 +520,7 @@ class Agent:
         show_thinking = self.config["agent"].get("show_thinking", True)
         decision = ""
         try:
-            extra_body = self._build_extra_body(low_model)
+            extra_body, top_level_params = self._build_extra_body(low_model)
             kwargs = dict(
                 model=low_model,
                 messages=[
@@ -501,11 +528,13 @@ class Agent:
                     {"role": "user", "content": f"当前步骤：{step_desc}\n\n最近工具调用摘要：\n{recent_tool_summary}"},
                 ],
                 temperature=0.0,
-                max_tokens=10,
+                max_completion_tokens=10,
                 stream=True,
             )
             if extra_body:
                 kwargs["extra_body"] = extra_body
+            if top_level_params:
+                kwargs.update(top_level_params)
 
             stream = self._client.chat.completions.create(**kwargs)
             in_reasoning = False
@@ -569,10 +598,16 @@ class Agent:
         tool_max_errors = tools_cfg.get("tool_max_errors", 3)
 
         # 模型路由
-        history_len = len(self.session_manager.get_history(self.session_id))
+        history = self.session_manager.get_history(self.session_id)
+        history_len = len(history)
+        # 取最近 4 条消息作为路由上下文（不含刚写入的 user 消息）
+        recent_ctx = [{"role": m["role"], "content": (m["content"] or "")[:300]}
+                      for m in history[-5:-1]]
         routed_model, route_reason, complexity = self._router.route(
             user_input, history_len, agent_cfg, self._client,
             manual_model=self._manual_model if self._routing_locked else None,
+            context_messages=recent_ctx,
+            session_tag=self._session_theme,
         )
         active_model = routed_model
 
@@ -582,8 +617,8 @@ class Agent:
         if self.config.get("routing", {}).get("show_routing_decision", True) and route_reason != "manual":
             self.console.print(f"[dim]路由决策：{active_model}  ({route_reason})  预估输入 ~{estimated_input} tokens[/dim]")
 
-        # 规划节点：medium / complex 任务先生成执行计划
-        if complexity in ("medium", "complex"):
+        # 规划节点：仅 plan 任务触发分步执行计划（由 AI 分类器显式判断）
+        if complexity == "plan":
             steps, plan_text = self._plan_node(user_input, messages, active_model)
             # 注入全局计划供模型参考，明确禁止提前执行未到步骤
             messages.append({
@@ -629,13 +664,20 @@ class Agent:
                     top_p=agent_cfg.get("top_p", 0.8),
                     stream_options={"include_usage": True},
                 )
-                extra_body = self._build_extra_body(active_model)
+                extra_body, top_level_params = self._build_extra_body(active_model)
                 if extra_body:
                     kwargs["extra_body"] = extra_body
+                if top_level_params:
+                    kwargs.update(top_level_params)
 
                 stream = self._client.chat.completions.create(**kwargs)
 
                 full_content = ""
+                # <theme> 标签内联提取状态（每轮重置）
+                _tbuf = ""          # 流开头的静默缓冲区
+                _theme_done = False  # True = 标签阶段结束，进入正常输出
+                _TOPEN = "<theme>"
+                _TCLOSE = "</theme>"
                 tool_calls_acc = []
                 finish_reason = None
                 in_reasoning = False
@@ -664,9 +706,36 @@ class Agent:
                             if not silent:
                                 self.console.print()
                             in_reasoning = False
-                        if not silent:
-                            self.console.print(delta.content, end="", markup=False, highlight=False)
-                        full_content += delta.content
+                        if not _theme_done:
+                            _tbuf += delta.content
+                            close_idx = _tbuf.find(_TCLOSE)
+                            if close_idx != -1:
+                                # 找到闭合标签
+                                open_idx = _tbuf.find(_TOPEN)
+                                if open_idx == 0:
+                                    # 标签在最开头，提取主题并丢弃标签
+                                    theme_val = _tbuf[len(_TOPEN):close_idx].strip()[:30]
+                                    if theme_val:
+                                        self._session_theme = theme_val
+                                    remainder = _tbuf[close_idx + len(_TCLOSE):].lstrip("\n")
+                                else:
+                                    # 标签不在开头，整段当正文
+                                    remainder = _tbuf
+                                _theme_done = True
+                                if remainder:
+                                    if not silent:
+                                        self.console.print(remainder, end="", markup=False, highlight=False)
+                                    full_content += remainder
+                            elif len(_tbuf) > 120:
+                                # 超过 120 字符仍无标签，当正文处理
+                                _theme_done = True
+                                if not silent:
+                                    self.console.print(_tbuf, end="", markup=False, highlight=False)
+                                full_content += _tbuf
+                        else:
+                            if not silent:
+                                self.console.print(delta.content, end="", markup=False, highlight=False)
+                            full_content += delta.content
 
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
@@ -682,6 +751,12 @@ class Agent:
                                 tool_calls_acc[idx]["function"]["name"] += tc_delta.function.name
                             if tc_delta.function and tc_delta.function.arguments:
                                 tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+
+                # 流结束时若缓冲区未处理（极短回复无法闭合标签），作正文输出
+                if not _theme_done and _tbuf:
+                    if not silent:
+                        self.console.print(_tbuf, end="", markup=False, highlight=False)
+                    full_content += _tbuf
 
                 if full_content or in_reasoning:
                     if not silent:
@@ -789,22 +864,39 @@ class Agent:
         if steps:
             # plan 模式：逐 step 执行
             silent_steps = not self.config["agent"].get("show_thinking", True)
+            step_context = ""        # 注入到下一步 system message 的提示文本
+            step_context_lines: list = []  # 用于构建 step_context 的原始条目
             for i, step_desc in enumerate(steps, 1):
                 self.console.print(f"\n[bold cyan]► Step {i}/{len(steps)}：[/bold cyan]{step_desc}")
                 # C+D：记录插入位置，注入含 [STEP_DONE] 协议的单步约束消息
                 step_msg_idx = len(messages)
+                step_context_hint = f"\n\n【前序步骤关键结论】\n{step_context}" if step_context else ""
                 messages.append({
                     "role": "system",
                     "content": (
                         f"【执行第 {i} 步，共 {len(steps)} 步】{step_desc}\n"
                         f"你当前只负责执行第 {i} 步。其余步骤会由系统在后续轮次单独调用，不要跨步骤执行。"
                         "完成本步骤后立即在回复末尾输出 [STEP_DONE] 停止。"
+                        "如果本步骤产生了对后续步骤有影响的重要信息（消歧义结论、关键发现、决策、确认的参数等），"
+                        "请在 [STEP_DONE] 之前额外输出 [STEP_CONTEXT]一句话总结[/STEP_CONTEXT]。"
+                        + step_context_hint
                     ),
                 })
                 last_content, reason = _run_tool_loop(step_desc, silent=silent_steps)
                 # C：步骤结束后移除约束消息，工具调用链保留
                 messages.pop(step_msg_idx)
                 step_contents.append(last_content)
+                # 解析 [STEP_CONTEXT] 标签，提取 AI 主动总结的关键信息
+                import re as _re2
+                ctx_match = _re2.search(r'\[STEP_CONTEXT\](.*?)\[/STEP_CONTEXT\]', last_content, _re2.DOTALL)
+                if ctx_match:
+                    entry = ctx_match.group(1).strip()[:100]  # AI 主动标注，限 100 字
+                    step_context_lines.append(f"Step {i}（{step_desc[:20]}）：{entry}")
+                elif last_content.strip():
+                    snippet = last_content.strip()[:80].replace("[STEP_DONE]", "").strip()
+                    step_context_lines.append(f"Step {i}（{step_desc[:20]}）：{snippet}")
+                # 更新 step_context 供下一步注入（最多保留最近 3 条）
+                step_context = "\n".join(step_context_lines[-3:])
                 self.console.print(f"[dim green]✓ Step {i} 完成[/dim green]")
                 if _task_aborted:
                     self.console.print("[bold red]任务已中止。[/bold red]")
@@ -826,16 +918,16 @@ class Agent:
                 {"prompt_tokens": _acc_input, "completion_tokens": _acc_output},
             )
         if self._memory_manager and self._memory_manager.available:
-            history = self.session_manager.get_history(self.session_id)
-            turn_count = len(history)
+            history_for_mem = self.session_manager.get_history(self.session_id)
+            turn_count = len(history_for_mem)
             if self._memory_manager.should_extract(turn_count, last_content):
-                recent = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+                recent = [{"role": m["role"], "content": m["content"]} for m in history_for_mem[-6:]]
                 self._memory_manager.extract_async(recent)
         return last_content
 
     def get_token_summary(self) -> dict:
         return self._token_tracker.get_session_summary(
-            self.session_manager, self.session_id, self.config.get("pricing", {})
+            self.session_manager, self.session_id
         )
 
     def toggle_skill(self, name: str, enabled: bool) -> bool:
@@ -847,10 +939,11 @@ class Agent:
         return False
 
     def switch_session(self, new_session_id: str):
-        """切换到指定会话：更新 session_id、重载历史摘要、重置 token 计数。"""
+        """切换到指定会话：更新 session_id、重载历史摘要、重置 token 计数和会话主题。"""
         self.session_id = new_session_id
         self._history_summary = self.session_manager.get_summary(new_session_id)
         self._token_tracker = TokenTracker()
+        self._session_theme = ""  # 新会话重置主题，等待重新提取
 
     def toggle_auto_confirm(self):
         self.auto_confirm = not self.auto_confirm

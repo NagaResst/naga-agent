@@ -79,12 +79,11 @@ class TokenTracker:
         session_manager.append_token_usage(session_id, record)
         return record
 
-    def get_session_summary(self, session_manager, session_id: str, pricing: dict) -> dict:
-        """汇总本会话累计 token 消耗和估算费用。"""
+    def get_session_summary(self, session_manager, session_id: str) -> dict:
+        """汇总本会话累计 token 消耗。"""
         records = session_manager.get_token_usage(session_id)
         total_input = 0
         total_output = 0
-        total_cost = 0.0
         per_model: dict = {}
 
         for r in records:
@@ -94,22 +93,16 @@ class TokenTracker:
             total_input += inp
             total_output += out
 
-            price = pricing.get(model, {})
-            cost = (inp / 1_000_000 * price.get("input", 0)) + (out / 1_000_000 * price.get("output", 0))
-            total_cost += cost
-
             if model not in per_model:
-                per_model[model] = {"input": 0, "output": 0, "cost": 0.0, "turns": 0}
+                per_model[model] = {"input": 0, "output": 0, "turns": 0}
             per_model[model]["input"] += inp
             per_model[model]["output"] += out
-            per_model[model]["cost"] += cost
             per_model[model]["turns"] += 1
 
         return {
             "total_input": total_input,
             "total_output": total_output,
             "total_tokens": total_input + total_output,
-            "total_cost_cny": round(total_cost, 6),
             "per_model": per_model,
             "turns": len(records),
             "tokenizer_mode": self._mode,

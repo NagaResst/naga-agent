@@ -229,4 +229,4 @@ if __name__ == "__main__":
     torch.set_num_threads(thread_count)
     print(f"[启动] CPU 线程数: {thread_count}", flush=True)
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)

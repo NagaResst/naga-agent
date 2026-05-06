@@ -2,13 +2,17 @@
 db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
-default = "qwen3.6-flash"
-available = ["qwen3.6-flash","qwen3.6-flash-2026-04-16", "qwen3.6-plus", "qwen3.6-max-preview"]
-base_url = ""  # 留空使用 OpenAI 官方地址，填入第三方兼容服务 URL，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+default = "gpt-5.4"
+available = ["gpt-5.4-mini", "gpt-5.4", "gpt-5"]
+base_url = "" 
 
 # 费用等级标记：low / medium / high
 # 同一 tier 有多个模型时，available 列表中靠后的优先
 [model.tiers]
+"gpt-5.4-mini" = "low"
+"gpt-5.4"      = "medium"
+"gpt-5"        = "high"
+# 通用扩展参数：对所有模型生效，模型专属参数（extra_params.<model>）会覆盖此处同名字段
 "qwen3.6-flash"            = "low"
 "qwen3.6-flash-2026-04-16" = "low"
 "qwen3.6-plus"             = "medium"
@@ -20,21 +24,9 @@ base_url = ""  # 留空使用 OpenAI 官方地址，填入第三方兼容服务 
 enable_thinking = true
 thinking_budget = 4000
 
-[model.extra_params."qwen3.6-flash-2026-04-16"]
-enable_thinking = true
-thinking_budget = 4000
-
-[model.extra_params."qwen3.6-plus"]
-enable_thinking = true
-thinking_budget = 4000
-
-[model.extra_params."qwen3.6-max-preview"]
-enable_thinking = true
-thinking_budget = 4000
-
 [routing]
 enabled = true
-classifier_model = "qwen3.6-flash"
+classifier_model = "gpt-5.4-mini"
 show_routing_decision = true
 
 # 路由结果映射到费用等级（low/medium/high），不绑定具体模型名
@@ -42,13 +34,7 @@ show_routing_decision = true
 simple  = "low"
 medium  = "medium"
 complex = "high"
-
-# 单价：元/百万token（人民币，中国内地站），仅用于本地费用估算
-[pricing]
-"qwen3.6-flash"            = { input = 1,  output = 6  }
-"qwen3.6-flash-2026-04-16" = { input = 1,  output = 6  }
-"qwen3.6-plus"             = { input = 2,  output = 12 }
-"qwen3.6-max-preview"      = { input = 9,  output = 54 }
+plan    = "high"
 
 [tools]
 command_timeout = 30       # execute_command 超时秒数
@@ -95,7 +81,7 @@ episodic_top_k = 3
 # Layer1 核心记忆全量注入 system prompt 的最大条数
 core_max_items = 20
 # mem0 内部提取记忆时使用的 LLM（需与 [model].base_url 接入点兼容）
-llm_model = "qwen3.6-flash"
+llm_model = "gpt-5.4-mini"
 
 [memory.embedder]
 # 嵌入模型：通过本地 Daemon 的 OpenAI 兼容接口（bge-base-zh-v1.5, 768 维）

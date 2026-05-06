@@ -154,11 +154,14 @@ def main():
             console.print("[green]自动确认已关闭（需手动确认）[/green]")
 
         elif user_input == "/thinking on":
+            agent.config["model"].setdefault("extra_params_default", {})["enable_thinking"] = True
             for m in agent.config["model"].get("extra_params", {}).values():
                 m["enable_thinking"] = True
-            console.print("[green]思维链已开启（修改 extra_params 中所有模型）[/green]")
+            console.print("[green]思维链已开启[/green]")
 
         elif user_input == "/thinking off":
+            agent.config["model"].get("extra_params_default", {}).pop("enable_thinking", None)
+            agent.config["model"].get("extra_params_default", {}).pop("thinking_budget", None)
             for m in agent.config["model"].get("extra_params", {}).values():
                 m.pop("enable_thinking", None)
                 m.pop("thinking_budget", None)
@@ -209,14 +212,12 @@ def main():
                 for model_name, s in summary.get("per_model", {}).items():
                     console.print(
                         f"  {model_name}  {s['turns']} 轮  "
-                        f"输入 {s['input']}  输出 {s['output']}  "
-                        f"费用 ¥{s['cost']:.6f}"
+                        f"输入 {s['input']}  输出 {s['output']}"
                     )
                 console.print(
                     f"  [bold]合计[/bold]  {summary['turns']} 轮  "
                     f"输入 {summary['total_input']}  输出 {summary['total_output']}  "
-                    f"总计 {summary['total_tokens']} tokens  "
-                    f"[bold]¥{summary['total_cost_cny']:.6f}[/bold]"
+                    f"总计 {summary['total_tokens']} tokens"
                 )
 
         elif user_input == "/session new":
@@ -266,8 +267,7 @@ def main():
             if summary.get("turns", 0) > 0:
                 console.print(
                     f"Token 消耗：{summary['total_tokens']} tokens  "
-                    f"(输入 {summary['total_input']} / 输出 {summary['total_output']})  "
-                    f"估算费用 [bold]¥{summary['total_cost_cny']:.6f}[/bold]"
+                    f"(输入 {summary['total_input']} / 输出 {summary['total_output']})"
                 )
 
         elif user_input.startswith("/prompt"):
