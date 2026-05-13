@@ -935,6 +935,13 @@ class Agent:
         for skill in self._skills:
             if skill["name"] == name:
                 skill["enabled"] = enabled
+                # 同步 _skills_enabled_names，确保 reload_skills() 后状态不丢失
+                if enabled:
+                    if name not in self._skills_enabled_names:
+                        self._skills_enabled_names.append(name)
+                else:
+                    if name in self._skills_enabled_names:
+                        self._skills_enabled_names.remove(name)
                 return True
         return False
 

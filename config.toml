@@ -3,15 +3,14 @@ db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录�
 
 [model]
 default = "gpt-5.4"
-available = ["gpt-5.4-mini", "gpt-5.4", "gpt-5"]
+available = ["gpt-5.4-mini", "gpt-5.4"]
 base_url = "" 
 
 # 费用等级标记：low / medium / high
 # 同一 tier 有多个模型时，available 列表中靠后的优先
 [model.tiers]
 "gpt-5.4-mini" = "low"
-"gpt-5.4"      = "medium"
-"gpt-5"        = "high"
+"gpt-5.4"      = "high"
 # 通用扩展参数：对所有模型生效，模型专属参数（extra_params.<model>）会覆盖此处同名字段
 "qwen3.6-flash"            = "low"
 "qwen3.6-flash-2026-04-16" = "low"
@@ -32,7 +31,7 @@ show_routing_decision = true
 # 路由结果映射到费用等级（low/medium/high），不绑定具体模型名
 [routing.model_map]
 simple  = "low"
-medium  = "medium"
+medium  = "high"
 complex = "high"
 plan    = "high"
 
@@ -52,7 +51,7 @@ temperature = 0.7
 top_p = 0.8
 show_thinking = true
 enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
-prompt_prefix = "雯雯在听"
+prompt_prefix = "你"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
 context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
 compress_threshold = 0.95         # 超过上下文窗口的 60% 时触发压缩管线

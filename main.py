@@ -8,10 +8,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from prompt_toolkit import prompt as pt_prompt
-from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.formatted_text import ANSI, HTML
 
 from agent.config import load_config
 from agent.core import Agent
+from agent.context_window import get_context_window
 from session.sqlite_session import SessionManager
 
 
@@ -128,9 +129,34 @@ def main():
 
     console.print(f"\n[dim]会话：{session_id}  模型：{model}  输入 /help 查看命令[/dim]\n")
 
+    def _context_toolbar():
+        """底部固定状态栏：显示当前模型和上下文窗口用量。"""
+        try:
+            history = session_manager.get_history(agent.session_id)
+            messages = [{"role": m["role"], "content": m["content"]} for m in history]
+            used = agent._token_tracker.estimate(messages)
+            max_ctx = get_context_window(
+                agent.model,
+                agent.config["agent"].get("context_token_limit", 0),
+            )
+            pct = used / max_ctx * 100 if max_ctx > 0 else 0
+            if pct < 60:
+                color = "ansigreen"
+            elif pct < 80:
+                color = "ansiyellow"
+            else:
+                color = "ansired"
+            max_k = f"{max_ctx // 1024}k" if max_ctx >= 1024 else str(max_ctx)
+            return HTML(
+                f" <b>模型:</b> {agent.model}  "
+                f"<b>上下文:</b> <{color}>{used:,} / {max_k} ({pct:.1f}%)</{color}> "
+            )
+        except Exception:
+            return ""
+
     while True:
         try:
-            user_input = pt_prompt(f"{prompt_prefix} > ").strip()
+            user_input = pt_prompt(f"{prompt_prefix} > ", bottom_toolbar=_context_toolbar).strip()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]已退出。[/dim]")
             break
@@ -305,7 +331,7 @@ def main():
             else:
                 console.print("[dim]已取消。[/dim]")
 
-        elif user_input == "/skill list":
+        elif user_input in ("/skill", "/skill list"):
             if not agent._skills:
                 console.print("[dim]skills/ 目录为空，暂无可用 skill。[/dim]")
             else:
