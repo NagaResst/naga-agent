@@ -13,31 +13,16 @@ def set_agent(agent):
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["skill", "技能", "加载", "移除", "扫描"],
     "function": {
         "name": "skill_manager",
-        "description": (
-            "管理 Agent 的 Skill（专项能力提示词）。支持从外部路径加载 skill 文件或目录、移除已有 skill、重新扫描 skills/ 目录。\n"
-            "action 说明：\n"
-            "  load   - 从指定路径复制 .md 文件或 skill 目录（含 SKILL.md）到 skills/ 目录，导入后自动激活，需提供 source_path\n"
-            "  remove - 从 skills/ 目录删除指定名称的 skill 并立即生效，需提供 name\n"
-            "  reload - 重新扫描 skills/ 目录，刷新 skill 列表"
-        ),
+        "description": "管理 Skill：load=加载外部skill文件/目录，remove=删除，reload=重扫描。",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["load", "remove", "reload"],
-                    "description": "操作类型",
-                },
-                "source_path": {
-                    "type": "string",
-                    "description": "load 动作：外部 .md 文件的绝对或相对路径（支持 ~ 展开）",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "remove 动作：要删除的 skill 名称（对应 skills/ 目录下的文件名，不含 .md）",
-                },
+                "action": {"type": "string", "enum": ["load", "remove", "reload"], "description": "操作类型"},
+                "source_path": {"type": "string", "description": "load：外部 .md 文件或 skill 目录路径"},
+                "name": {"type": "string", "description": "remove：skill 名称"},
             },
             "required": ["action"],
         },

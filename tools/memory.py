@@ -10,22 +10,10 @@ def set_memory_manager(mm):
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["记忆", "记录", "保存", "知识库", "文档导入", "搜索记忆", "删除记忆"],
     "function": {
         "name": "memory",
-        "description": (
-            "跨会话持久化记忆存储。拥有两个记忆来源：\n"
-            "① 对话记忆（自动从对话中提取偏好、事实）\n"
-            "② 手动知识库（用户主动导入的文档，按标题拆分存储）\n"
-            "数据持久存储，不会随会话结束而丢失。\n"
-            "action 说明：\n"
-            "  save          - 保存一条核心记忆，需提供 key 和 value\n"
-            "  recall        - 读取指定 key 的记忆\n"
-            "  list          - 列出所有核心记忆\n"
-            "  delete        - 删除指定 key 的核心记忆\n"
-            "  add_document  - 导入一个文档到知识库，自动按标题拆分为多条记忆并存储\n"
-            "  forget        - 从知识库中删除指定记忆（按标题或来源匹配）\n"
-            "  search        - 语义搜索记忆（可指定搜索范围：core/manual/all）"
-        ),
+        "description": "持久化记忆。save/recall/list/delete=核心记忆；add_document/forget=知识库；search=语义搜索。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -34,39 +22,14 @@ TOOL_DEFINITION = {
                     "enum": ["save", "recall", "list", "delete", "add_document", "forget", "search"],
                     "description": "操作类型",
                 },
-                "key": {
-                    "type": "string",
-                    "description": "记忆的键名（save/recall/delete 时需要）",
-                },
-                "value": {
-                    "type": "string",
-                    "description": "要保存的记忆内容（仅 save 时需要）",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "文档文件路径（add_document 时需要）",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "文档完整内容（add_document 时需要，与 path 二选一）",
-                },
-                "source": {
-                    "type": "string",
-                    "description": "文档来源标识，如文件名或路径（add_document 时需要）",
-                },
-                "title_or_source": {
-                    "type": "string",
-                    "description": "要删除的记忆标题或来源（forget 时需要）",
-                },
-                "query": {
-                    "type": "string",
-                    "description": "搜索关键词（search 时需要）",
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["core", "manual", "all"],
-                    "description": "搜索范围：core=核心记忆, manual=手动知识库, all=全部（默认 manual）",
-                },
+                "key": {"type": "string", "description": "记忆键名（save/recall/delete）"},
+                "value": {"type": "string", "description": "记忆内容（save）"},
+                "path": {"type": "string", "description": "文档路径（add_document）"},
+                "content": {"type": "string", "description": "文档内容（add_document，与path二选一）"},
+                "source": {"type": "string", "description": "文档来源标识（add_document）"},
+                "title_or_source": {"type": "string", "description": "标题或来源（forget）"},
+                "query": {"type": "string", "description": "搜索词（search）"},
+                "scope": {"type": "string", "enum": ["core", "manual", "all"], "description": "搜索范围（默认manual）"},
             },
             "required": ["action"],
         },

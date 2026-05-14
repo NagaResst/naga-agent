@@ -2,29 +2,16 @@ import os
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["文件", "编辑", "修改", "替换", "写入", "代码", "配置"],
     "function": {
         "name": "edit_file",
-        "description": (
-            "对本地文件进行精确的字符串替换编辑。"
-            "提供 old_string（必须与文件中某段文本完全一致）和 new_string（替换后的内容）。"
-            "比通过 execute_command 使用 sed 更安全可控，且无需命令确认。"
-            "若 old_string 在文件中不存在或匹配多处，操作会被拒绝并返回明确错误。"
-        ),
+        "description": "对文件做精确字符串替换（old_string 须唯一匹配，含空格换行）。",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "文件的绝对路径或相对于当前工作目录的路径",
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "要替换的原始文本，必须与文件中某段内容完全一致（含空格和换行）",
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "替换后的新内容",
-                },
+                "path": {"type": "string", "description": "文件路径"},
+                "old_string": {"type": "string", "description": "被替换的原始文本（须唯一匹配）"},
+                "new_string": {"type": "string", "description": "替换后的新内容"},
             },
             "required": ["path", "old_string", "new_string"],
         },

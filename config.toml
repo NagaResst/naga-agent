@@ -54,8 +54,15 @@ enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
 prompt_prefix = "你"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
 context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
-compress_threshold = 0.95         # 超过上下文窗口的 60% 时触发压缩管线
+compress_threshold = 0.95         # 超过上下文窗口的此比例时触发压缩管线
 tool_output_max_chars = 300       # 旧轮次工具输出最大保留字符数
+# 滑动窗口三档配置（以 user 消息为结尾的完整 turn 数量）
+history_lo_threshold   = 0.30    # token 使用率低于此值时使用 lo 档
+history_keep_turns_lo  = 30      # token < lo_threshold 时保留的 turn 数
+history_keep_turns_mid = 10       # lo_threshold ≤ token < compress_threshold 时保留的 turn 数
+history_keep_turns_hi  = 3       # 压缩管线内保留的 turn 数（最少保留最后 2 轮）
+# Skill 层注入模式：auto（首次多 system 失败自动降级）/ multi_system / merge
+skill_layer_mode = "auto"
 
 [search]
 max_results = 10        # 单次搜索返回最大条数

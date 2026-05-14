@@ -45,23 +45,15 @@ def _truncate_output(text: str, max_chars: int) -> str:
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["命令", "shell", "执行", "安装", "运行", "脚本", "终端", "系统", "进程", "部署"],
     "function": {
         "name": "execute_command",
-        "description": (
-            "在本地终端执行一条 Shell 命令。"
-            "仅在确实需要运行系统命令时使用，例如查看文件、安装依赖、运行脚本等。"
-        ),
+        "description": "执行本地 Shell 命令。",
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "要执行的完整 Shell 命令",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "对该命令意图的简短说明，便于用户理解",
-                },
+                "command": {"type": "string", "description": "Shell 命令"},
+                "description": {"type": "string", "description": "命令意图说明"},
             },
             "required": ["command", "description"],
         },

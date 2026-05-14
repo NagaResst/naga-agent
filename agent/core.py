@@ -32,14 +32,14 @@ class Agent:
         self.console = console
         self.auto_confirm = config["agent"]["auto_confirm"]
         self.max_history = config["agent"]["max_history"]
-        # 历史摘要：优先从持久化存储恢复，确保重启后上下文不丢失
-        self._history_summary = session_manager.get_summary(session_id)
 
         self._client = OpenAI(
             api_key=config["api_key"],
             base_url=config.get("base_url") or None,
         )
         self.tool_definitions, self.tool_executors = discover_tools()
+        # 常驻工具：无论上下文如何，每次都注入（不参与按需过滤）
+        self._core_tools = {"web_search", "fetch_url", "execute_command", "memory"}
 
         # 启动语义引擎子进程（mem0 和手动记忆共用 bge-base-zh-v1.5）
         self._daemon_proc = None
@@ -167,6 +167,14 @@ class Agent:
         # 会话主题追踪（内联标签方式，每轮从主模型回复中提取，零额外 API 调用）
         self._session_theme: str = ""
 
+        # system prompt token 缓存（分两层独立维护，用于补偿历史 token 估算）
+        # 主层：base_prompt + 行为规则 + 记忆块 + skill 摘要列表
+        # skill 层：命中 skill 的全文（未命中时为 0）
+        self._last_main_system_tokens: int = 0
+        self._last_skill_system_tokens: int = 0
+        # skill_layer_mode 降级标记：auto 模式下若 API 不支持多 system 消息则置 True
+        self._skill_layer_merged: bool = False
+
     def _cleanup_daemon(self):
         """主进程退出时终止语义引擎子进程。"""
         if self._daemon_proc and self._daemon_proc.poll() is None:
@@ -179,21 +187,88 @@ class Agent:
         """重新扫描 skills/ 目录，热更新已加载的 skill 列表。"""
         self._skills = discover_skills(self._skills_dir, self._skills_enabled_names)
 
+    def _select_tools(self, last_user_msg: str) -> list:
+        """按需工具注入：
+
+        - 常驻工具 + 关键词命中的工具：发完整 schema
+        - 其余工具：只发最小存根（name only），让模型知道工具存在但不占 token
+        发给 API 的 tools 列表去掉自定义 tags 字段。
+        """
+        import re as _re
+        signal = (self._session_theme + " " + last_user_msg[:200]).lower()
+
+        full, stub_names = [], []
+        for td in self.tool_definitions:
+            name = td.get("function", {}).get("name", "")
+            if name in self._core_tools or any(tag.lower() in signal for tag in td.get("tags", [])):
+                # 完整 schema，去掉 tags
+                full.append({k: v for k, v in td.items() if k != "tags"})
+            else:
+                stub_names.append(name)
+
+        # 最小存根：只有 name，parameters 为空对象
+        stubs = [
+            {"type": "function", "function": {"name": n, "parameters": {"type": "object", "properties": {}}}}
+            for n in stub_names
+        ]
+        return full + stubs or None
+
+    def _match_skills(self, last_user_msg: str) -> tuple[list, list]:
+        """根据会话主题 + 最后用户消息，将激活的 skill 分为命中（全文注入）和未命中（摘要）。
+
+        匹配逻辑：将 description 按标点/空格分词，任意一个词（≥2字）出现在信号中即命中。
+        返回 (hit_skills, miss_skills)，均为 skill dict 列表。
+        """
+        import re
+        signal = (self._session_theme + " " + last_user_msg[:200]).lower()
+        hit, miss = [], []
+        for skill in self._skills:
+            if not skill["enabled"]:
+                continue
+            desc = skill.get("description", "").lower()
+            words = re.split(r'[\s，。、；：！？/\-_]+', desc)
+            words = [w for w in words if len(w) >= 2]
+            if any(w in signal for w in words):
+                hit.append(skill)
+            else:
+                miss.append(skill)
+        return hit, miss
+
     def _get_messages(self) -> list:
+        import re as _re
         history = self.session_manager.get_history(self.session_id)
 
-        # 构建不含 system prompt 的原始消息列表，用于 token 估算
-        raw_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+        # Bug1 fix：保留完整消息结构（含 tool_calls）用于正确 token 估算
+        raw_messages = list(history) if history else []
 
         # 动态获取当前模型的上下文窗口大小
         context_window = get_context_window(
             self.model,
             self.config["agent"].get("context_token_limit", 0),
         )
-        threshold = self.config["agent"].get("compress_threshold", 0.60)
+        threshold = self.config["agent"].get("compress_threshold", 0.95)
         tool_max_chars = self.config["agent"].get("tool_output_max_chars", 300)
+        lo_threshold = self.config["agent"].get("history_lo_threshold", 0.30)
+        keep_lo = self.config["agent"].get("history_keep_turns_lo", 10)
+        keep_mid = self.config["agent"].get("history_keep_turns_mid", 6)
+        keep_hi = self.config["agent"].get("history_keep_turns_hi", 3)
 
-        estimated_tokens = self._token_tracker.estimate(raw_messages)
+        # Bug2 fix：估算时加上上一轮 system prompt 的缓存 token 数
+        history_tokens = self._token_tracker.estimate(raw_messages)
+        estimated_tokens = history_tokens + self._last_main_system_tokens + self._last_skill_system_tokens
+        usage_ratio = estimated_tokens / context_window if context_window > 0 else 0.0
+
+        # 三档滑动窗口（每次发消息前都执行，不落盘）
+        keep_turns = summarizer.pick_keep_turns(
+            usage_ratio,
+            lo_threshold=lo_threshold,
+            compress_threshold=threshold,
+            keep_lo=keep_lo,
+            keep_mid=keep_mid,
+            keep_hi=keep_hi,
+        )
+        raw_messages = summarizer.sliding_window_trim(raw_messages, keep_turns=keep_turns)
+
         if summarizer.should_compress(estimated_tokens, context_window, threshold):
             # 触发前先同步 mem0 提取，确保即将被压缩的内容已落入记忆
             if self._memory_manager and self._memory_manager.available:
@@ -205,9 +280,10 @@ class Agent:
                 context_window,
                 threshold,
                 tool_max_chars,
+                keep_hi=keep_hi,
             )
 
-        # 每轮动态构建 system prompt：base + 记忆层 + 历史摘要（不修改 config，避免累积）
+        # ── 构建主层 system prompt ──────────────────────────────────────────
         base_prompt = self.config["agent"].get("system_prompt", "").strip()
 
         # 通用行为规则：信息不足时优先提问
@@ -219,16 +295,7 @@ class Agent:
         )
         base_prompt += _ask_rule
 
-        # 会话意图锚：取第一条 user 消息作为锁定开始点
-        first_user = next(
-            (m["content"] for m in (self.session_manager.get_history(self.session_id) or [])
-             if m.get("role") == "user"), ""
-        )
-        if first_user:
-            anchor = first_user[:100] + ("..." if len(first_user) > 100 else "")
-            base_prompt += f"\n\n【本次会话起点】\n{anchor}"
-
-        # 会话主题（内联标签：要求模型每次回复开头输出 <theme> 标签，流式接收时静默提取后剥离）
+        # 会话主题（内联标签协议）
         _theme_instr = (
             "\n\n【主题标签协议】\n"
             "每次回复的**最开头**先输出 `<theme>主题关键词(10字以内)</theme>` 然后换行，"
@@ -247,22 +314,15 @@ class Agent:
             memory_block = ("\n\n【用户记忆】\n" + "\n".join(f"  {k}: {v}" for k, v in memories.items())) if memories else ""
 
         # Layer2 情节记忆（语义检索，取最后一条用户消息作为 query）
+        last_user_msg = next((m.get("content", "") for m in reversed(raw_messages) if m.get("role") == "user"), "")
         episodic_block = ""
-        if self._memory_manager and self._memory_manager.available:
-            last_user = next((m["content"] for m in reversed(raw_messages) if m.get("role") == "user"), "")
-            if last_user:
-                top_k = self.config.get("memory", {}).get("episodic_top_k", 3)
-                episodic_items = self._memory_manager.search_episodic(last_user, top_k=top_k)
-                if episodic_items:
-                    episodic_block = "\n\n【相关记忆】\n" + "\n".join(f"  {m}" for m in episodic_items)
+        if self._memory_manager and self._memory_manager.available and last_user_msg:
+            top_k = self.config.get("memory", {}).get("episodic_top_k", 3)
+            episodic_items = self._memory_manager.search_episodic(last_user_msg, top_k=top_k)
+            if episodic_items:
+                episodic_block = "\n\n【相关记忆】\n" + "\n".join(f"  {m}" for m in episodic_items)
 
-        # Layer3：只读旧摘要，不再写入
-        summary_block = f"\n\n【早期对话摘要】\n{self._history_summary}" if self._history_summary else ""
-
-        # 激活的 skill prompt 追加在最末尾
-        skill_block = "\n\n".join(s["prompt"] for s in self._skills if s["enabled"])
-
-        # 双记忆源描述：告知 Agent 有两种记忆来源
+        # 双记忆源描述
         dual_memory_desc = (
             "\n\n【记忆系统说明】\n"
             "你有两种记忆来源：\n"
@@ -271,11 +331,60 @@ class Agent:
             "使用 memory 工具的 search 操作可同时检索两个来源；add_document 用于导入文档；forget 用于删除记忆。"
         )
 
-        system_prompt = base_prompt + memory_block + episodic_block + summary_block + dual_memory_desc
-        if skill_block:
-            system_prompt += "\n\n" + skill_block
-        if system_prompt.strip():
-            raw_messages.insert(0, {"role": "system", "content": system_prompt.strip()})
+        # ── Skill 处理：命中判断 + 摘要常驻 ──────────────────────────────────
+        hit_skills, miss_skills = self._match_skills(last_user_msg)
+        all_active = hit_skills + miss_skills
+
+        skill_summary_block = ""
+        if all_active:
+            lines = []
+            for s in all_active:
+                desc = s.get("description", "") or s["name"]
+                lines.append(f"- {s['name']}：{desc}")
+            skill_summary_block = "\n\n【可用 Skill】\n" + "\n".join(lines)
+
+        # 主层 system prompt（不含命中 skill 全文）
+        main_system = base_prompt + memory_block + episodic_block + dual_memory_desc + skill_summary_block
+
+        # 缓存主层 token 数（供下一轮估算补偿）
+        self._last_main_system_tokens = self._token_tracker.count_tokens(main_system)
+
+        # ── Skill 层：命中 skill 全文 ─────────────────────────────────────────
+        skill_full_content = ""
+        if hit_skills:
+            parts = []
+            for s in hit_skills:
+                parts.append(f"【激活 Skill：{s['name']}】\n{s['prompt']}")
+            skill_full_content = "\n\n".join(parts)
+
+        # 缓存 skill 层 token 数
+        self._last_skill_system_tokens = self._token_tracker.count_tokens(skill_full_content) if skill_full_content else 0
+
+        # ── 拼装最终消息列表 ────────────────────────────────────────────────
+        skill_layer_mode = self.config["agent"].get("skill_layer_mode", "auto")
+        use_multi_system = (
+            skill_full_content
+            and not self._skill_layer_merged
+            and skill_layer_mode in ("auto", "multi_system")
+        ) or (
+            skill_full_content
+            and skill_layer_mode == "multi_system"
+        )
+        use_merge = skill_layer_mode == "merge" or (skill_full_content and self._skill_layer_merged)
+
+        if main_system.strip():
+            if use_merge and skill_full_content:
+                # 降级模式：拼接到主层末尾
+                merged = main_system + "\n\n" + skill_full_content
+                raw_messages.insert(0, {"role": "system", "content": merged.strip()})
+            elif use_multi_system:
+                # 双 system 消息模式
+                raw_messages.insert(0, {"role": "system", "content": skill_full_content.strip()})
+                raw_messages.insert(0, {"role": "system", "content": main_system.strip()})
+            else:
+                # 无命中 skill / merge 已禁用
+                raw_messages.insert(0, {"role": "system", "content": main_system.strip()})
+
         return raw_messages
 
     def _call_tool(self, name: str, args: dict) -> str:
@@ -655,10 +764,12 @@ class Agent:
             recent_tool_lines: _deque = _deque(maxlen=replan_repeat_window)
 
             while True:
+                _last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+                _active_tools = self._select_tools(_last_user) or None
                 kwargs = dict(
                     model=active_model,
                     messages=messages,
-                    tools=self.tool_definitions if self.tool_definitions else None,
+                    tools=_active_tools,
                     stream=True,
                     temperature=agent_cfg.get("temperature", 0.7),
                     top_p=agent_cfg.get("top_p", 0.8),
@@ -670,7 +781,29 @@ class Agent:
                 if top_level_params:
                     kwargs.update(top_level_params)
 
-                stream = self._client.chat.completions.create(**kwargs)
+                try:
+                    stream = self._client.chat.completions.create(**kwargs)
+                except Exception as _api_err:
+                    # auto 模式：若多条 system 消息导致 4xx 错误，自动降级并重试一次
+                    _err_str = str(_api_err).lower()
+                    _cur_msgs = kwargs["messages"]
+                    _has_multi_sys = sum(1 for m in _cur_msgs if m.get("role") == "system") > 1
+                    _skill_mode = self.config["agent"].get("skill_layer_mode", "auto")
+                    if (
+                        _has_multi_sys
+                        and _skill_mode == "auto"
+                        and not self._skill_layer_merged
+                        and ("400" in _err_str or "bad request" in _err_str or "invalid" in _err_str)
+                    ):
+                        self.console.print("[dim yellow]多 system 消息不受支持，自动降级为 merge 模式并重试…[/dim yellow]")
+                        self._skill_layer_merged = True
+                        _sys_msgs = [m for m in _cur_msgs if m.get("role") == "system"]
+                        _non_sys = [m for m in _cur_msgs if m.get("role") != "system"]
+                        _merged = "\n\n".join(m["content"] for m in _sys_msgs if m.get("content"))
+                        kwargs["messages"] = [{"role": "system", "content": _merged}] + _non_sys
+                        stream = self._client.chat.completions.create(**kwargs)
+                    else:
+                        raise
 
                 full_content = ""
                 # <theme> 标签内联提取状态（每轮重置）
@@ -942,15 +1075,19 @@ class Agent:
                 else:
                     if name in self._skills_enabled_names:
                         self._skills_enabled_names.remove(name)
+                # skill 激活状态变化，清零 skill token 缓存，下一轮重新计算
+                self._last_skill_system_tokens = 0
                 return True
         return False
 
     def switch_session(self, new_session_id: str):
-        """切换到指定会话：更新 session_id、重载历史摘要、重置 token 计数和会话主题。"""
+        """切换到指定会话：更新 session_id、重置 token 计数和会话主题。"""
         self.session_id = new_session_id
-        self._history_summary = self.session_manager.get_summary(new_session_id)
         self._token_tracker = TokenTracker()
         self._session_theme = ""  # 新会话重置主题，等待重新提取
+        self._last_main_system_tokens = 0
+        self._last_skill_system_tokens = 0
+        self._skill_layer_merged = False  # 新会话重新尝试双 system 模式
 
     def toggle_auto_confirm(self):
         self.auto_confirm = not self.auto_confirm

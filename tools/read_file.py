@@ -42,27 +42,16 @@ def _detect_file_type(path: str) -> str:
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["文件", "读取", "查看", "代码", "日志", "配置", "内容"],
     "function": {
         "name": "read_file",
-        "description": (
-            "读取本地文件内容并返回给模型。支持按行范围读取，避免大文件一次性返回过多内容。"
-            "适用于查看代码、配置文件、日志等场景。"
-        ),
+        "description": "读取本地文件内容，支持按行范围读取。",
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "文件的绝对路径或相对于当前工作目录的路径",
-                },
-                "start_line": {
-                    "type": "integer",
-                    "description": "起始行号（从 1 开始，可选，默认从第 1 行开始）",
-                },
-                "end_line": {
-                    "type": "integer",
-                    "description": "结束行号（包含，可选，默认读到文件末尾）",
-                },
+                "path": {"type": "string", "description": "文件路径"},
+                "start_line": {"type": "integer", "description": "起始行号（从1开始）"},
+                "end_line": {"type": "integer", "description": "结束行号（含）"},
             },
             "required": ["path"],
         },

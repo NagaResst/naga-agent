@@ -95,25 +95,15 @@ _HTTP_STATUS_MESSAGES = {
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["url", "网页", "抓取", "读取网页", "文档", "http"],
     "function": {
         "name": "fetch_url",
-        "description": (
-            "访问指定 URL，提取页面正文内容并返回对 AI 友好的纯文本。\n"
-            "自动过滤导航栏、广告、脚本等噪音，优先提取文章主体内容。\n"
-            "适合在 web_search 搜索后读取具体页面的完整内容。\n"
-            "也可直接访问官方文档、技术博客等 URL 获取信息。"
-        ),
+        "description": "访问 URL，返回页面正文纯文本（自动过滤噪音）。",
         "parameters": {
             "type": "object",
             "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "要访问的完整 URL（需包含 http:// 或 https://）",
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "返回正文最大字符数（默认 4000，最大 8000）",
-                },
+                "url": {"type": "string", "description": "完整 URL（含 http/https）"},
+                "max_chars": {"type": "integer", "description": "正文最大字符数（默认4000，最大8000）"},
             },
             "required": ["url"],
         },

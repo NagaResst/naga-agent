@@ -2,27 +2,16 @@ import os
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["脚本", "生成", "代码", "文件", "shell", "python", "写"],
     "function": {
         "name": "generate_script",
-        "description": (
-            "在当前工作目录下的 generated_scripts 子目录中生成一个脚本文件。"
-            "适用于需要保存代码片段、Shell 脚本或其他可执行文件的场景。"
-        ),
+        "description": "在 generated_scripts/ 目录生成脚本文件。",
         "parameters": {
             "type": "object",
             "properties": {
-                "filename": {
-                    "type": "string",
-                    "description": "脚本文件名，例如 deploy.sh 或 cleanup.py",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "脚本文件的完整内容",
-                },
-                "language": {
-                    "type": "string",
-                    "description": "脚本语言，例如 bash、sh、python、ruby 等",
-                },
+                "filename": {"type": "string", "description": "文件名，如 deploy.sh"},
+                "content": {"type": "string", "description": "文件完整内容"},
+                "language": {"type": "string", "description": "脚本语言，如 bash/python"},
             },
             "required": ["filename", "content", "language"],
         },

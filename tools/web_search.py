@@ -29,33 +29,16 @@ BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
 
 TOOL_DEFINITION = {
     "type": "function",
+    "tags": ["搜索", "查询", "查找", "天气", "新闻", "网络", "互联网", "了解", "最新", "资讯"],
     "function": {
         "name": "web_search",
-        "description": (
-            "在互联网上搜索信息。\n"
-            "优先使用博查（Bocha）API；当 Bocha 配额耗尽、限速或不可用时，自动降级至 DuckDuckGo，无需干预。\n"
-            "返回结构化搜索结果，含标题、URL、摘要和可信度信号。\n"
-            "适合搜索技术文档、运维操作、产品信息等。\n\n"
-            "重要决策规则：\n"
-            "- 搜索后如果摘要信息不足以做出判断，必须优先使用 fetch_url 工具读取最相关结果的原文，而非换词重新搜索。\n"
-            "- 只有在 fetch_url 读取原文后仍然无法回答时，才可更换关键词再次搜索。\n"
-            "- 禁止在未读取任何原文的情况下连续多次搜索同一主题。"
-        ),
+        "description": "联网搜索。摘要不足时用 fetch_url 读原文，勿连续重复搜索同一主题。",
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "搜索关键词，建议使用中文，尽量具体",
-                },
-                "count": {
-                    "type": "integer",
-                    "description": "返回结果数量（1-10，默认 5）",
-                },
-                "freshness": {
-                    "type": "string",
-                    "description": "时效过滤：oneDay（一天内）/ oneWeek（一周内）/ oneMonth（一个月内）/ noLimit（不限，默认）",
-                },
+                "query": {"type": "string", "description": "搜索关键词"},
+                "count": {"type": "integer", "description": "返回数量（1-10，默认5）"},
+                "freshness": {"type": "string", "description": "时效：oneDay/oneWeek/oneMonth/noLimit"},
             },
             "required": ["query"],
         },
