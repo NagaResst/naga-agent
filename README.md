@@ -176,11 +176,19 @@ Step 3  dual_track_compress（兜底）
 ---
 name: ops-expert
 description: 运维专家模式，强化 K8s/Linux 操作指引
+keywords: ["k8s", "kubernetes", "linux 运维", "故障排查"]
+examples: ["帮我排查 k8s pod 重启", "分析这台 Linux 机器的 CPU 飙高原因"]
 enabled: false
 ---
 
 你是一个资深运维工程师，处理以下任务时...
 ```
+
+推荐为每个 Skill 补充 `keywords` 和 `examples`：
+
+- `keywords`：放 5~12 个高区分度短语，优先写用户真实会说的话，不要只写泛词。
+- `examples`：放 2~5 条典型请求，帮助匹配器识别近似表达。
+- `description`：保留一段简洁摘要，不要把整套执行流程塞进 frontmatter。
 
 | 操作 | 命令 |
 |------|------|
@@ -193,7 +201,14 @@ enabled: false
 ```toml
 [skills]
 enabled = ["ops-expert", "code-reviewer"]
+match_top_k = 2
+summary_top_k = 6
+min_match_score = 2.2
 ```
+
+匹配策略说明：Agent 会综合 `name`、`description`、`keywords`、`examples` 做相关度排序，只把 Top-K 命中的 Skill 全文注入 prompt，其余仅保留摘要，避免无关 Skill 污染上下文。
+
+如果你想在对话里强制使用某个 Skill，可以在用户消息里显式写 `@skill(skill-name)`，例如 `@skill(fund-deep-research) 帮我分析 007119`。这样该 Skill 会被直接提升到注入优先级最高。
 
 ---
 

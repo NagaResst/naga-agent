@@ -1,103 +1,172 @@
-"""模型上下文窗口大小映射表。
+"""模型上下文窗口探测器。
 
 查找优先级：
-  1. config 手动指定（context_token_limit > 0）
-  2. 精确模型名匹配
-  3. 前缀匹配（处理带日期后缀的模型名）
-  4. 默认值 131072（128k）
+    1. config 手动指定（context_token_limit > 0）
+    2. 本地持久化缓存 / 进程内缓存（仅接受远端 metadata 已确认的值）
+    3. provider models 元数据中的上下文字段
+    4. 默认值 200000（200k）
+
+说明：
+    - 不允许基于模型名、usage、报错文本做推断。
+    - 如果远端 models 接口不暴露上下文窗口，就只能回退到保守默认值或由用户手动覆盖。
 """
 
-_DEFAULT = 131072  # 128k，保守但足够的通用默认值
+from __future__ import annotations
 
-_KNOWN_CONTEXT_WINDOWS: dict[str, int] = {
-    # OpenAI
-    "gpt-4.1":                    1047576,
-    "gpt-4.1-mini":               1047576,
-    "gpt-4.1-nano":               1047576,
-    "gpt-4o":                      128000,
-    "gpt-4o-mini":                 128000,
-    "gpt-4-turbo":                 128000,
-    "gpt-4":                         8192,
-    "gpt-3.5-turbo":               16385,
-    "o1":                          200000,
-    "o1-mini":                     128000,
-    "o3":                          200000,
-    "o3-mini":                     200000,
-    "o4-mini":                     200000,
-    # Anthropic Claude
-    "claude-3-5-sonnet":           200000,
-    "claude-3-5-haiku":            200000,
-    "claude-3-opus":               200000,
-    "claude-3-sonnet":             200000,
-    "claude-3-haiku":              200000,
-    # DeepSeek
-    "deepseek-chat":               128000,
-    "deepseek-reasoner":           128000,
-    "deepseek-r1":                 128000,
-    "deepseek-v3":                 128000,
-    # Qwen3 系列
-    "qwen3-235b-a22b":             131072,
-    "qwen3-32b":                   131072,
-    "qwen3-14b":                   131072,
-    "qwen3-8b":                    131072,
-    "qwen3-4b":                    131072,
-    "qwen3.6-flash":               131072,
-    "qwen3.6-plus":                131072,
-    "qwen3.6-max":                 131072,
-    # Qwen2.5 系列
-    "qwen2.5-72b-instruct":        131072,
-    "qwen2.5-32b-instruct":        131072,
-    "qwen2.5-14b-instruct":        131072,
-    "qwen2.5-7b-instruct":         131072,
-    "qwen-max":                    131072,
-    "qwen-plus":                   131072,
-    "qwen-turbo":                   32000,
-    # Gemini
-    "gemini-2.0-flash":           1048576,
-    "gemini-1.5-pro":             2097152,
-    "gemini-1.5-flash":           1048576,
-    # Mistral
-    "mistral-large":               131072,
-    "mistral-small":               131072,
-    "mixtral-8x22b":                65536,
-    # Meta Llama（Ollama / 本地）
-    "llama3.3":                    131072,
-    "llama3.2":                    131072,
-    "llama3.1":                    131072,
-    "llama3":                        8192,
-    "llama2":                        4096,
-    # Ollama 其他常用模型
-    "mistral":                      32768,
-    "codellama":                    16384,
-    "phi4":                        131072,
-    "phi3":                        131072,
-    "gemma3":                      131072,
-    "gemma2":                        8192,
-    "qwq":                         131072,
-}
+import json
+import os
+import threading
+from typing import Any
+
+_DEFAULT = 200000  # 200k，未知模型时的保守回退值
+_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".context_window_cache.json")
+_CACHE_LOCK = threading.Lock()
+_CACHE_LOADED = False
+_DETECTED_WINDOWS: dict[str, int] = {}
+
+_CONTEXT_KEYS = (
+    "context_window",
+    "context_length",
+    "max_context_tokens",
+    "max_input_tokens",
+    "input_token_limit",
+    "max_prompt_tokens",
+    "max_sequence_length",
+    "max_position_embeddings",
+)
 
 
-def get_context_window(model: str, config_override: int = 0) -> int:
-    """返回指定模型的上下文窗口大小（token 数）。
+def _normalize_base_url(base_url: str | None) -> str:
+    return (base_url or "default").rstrip("/").lower()
 
-    Args:
-        model: 模型名称，如 "gpt-4o" 或 "qwen3.6-flash-2026-04-16"
-        config_override: config.toml 中手动指定的值；> 0 时直接返回此值
 
-    Returns:
-        上下文窗口大小（token 数）
-    """
+def _cache_key(model: str, base_url: str | None) -> str:
+    return f"{_normalize_base_url(base_url)}::{(model or '').strip().lower()}"
+
+
+def _load_cache():
+    global _CACHE_LOADED
+    if _CACHE_LOADED:
+        return
+    with _CACHE_LOCK:
+        if _CACHE_LOADED:
+            return
+        if os.path.exists(_CACHE_FILE):
+            try:
+                with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    for key, value in payload.items():
+                        if isinstance(value, dict):
+                            source = value.get("source", "")
+                            window = value.get("context_window", 0)
+                            if source == "remote_metadata" and isinstance(window, int) and window > 0:
+                                _DETECTED_WINDOWS[key] = window
+            except Exception:
+                pass
+        _CACHE_LOADED = True
+
+
+def _save_cache():
+    with _CACHE_LOCK:
+        try:
+            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+                payload = {
+                    key: {"context_window": value, "source": "remote_metadata"}
+                    for key, value in _DETECTED_WINDOWS.items()
+                    if isinstance(value, int) and value > 0
+                }
+                json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+
+def _extract_context_value(payload: Any) -> int:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            lowered = key.lower()
+            if lowered in _CONTEXT_KEYS and isinstance(value, int) and value > 0:
+                return value
+            detected = _extract_context_value(value)
+            if detected > 0:
+                return detected
+    elif isinstance(payload, list):
+        for item in payload:
+            detected = _extract_context_value(item)
+            if detected > 0:
+                return detected
+    return 0
+
+
+def _to_dict(item: Any) -> dict[str, Any]:
+    if item is None:
+        return {}
+    if hasattr(item, "to_dict"):
+        try:
+            return item.to_dict()
+        except Exception:
+            return {}
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "__dict__"):
+        return dict(item.__dict__)
+    return {}
+
+
+def _detect_from_metadata(model: str, client=None) -> int:
+    if client is None or not model:
+        return 0
+
+    try:
+        payload = _to_dict(client.models.retrieve(model))
+        detected = _extract_context_value(payload)
+        if detected > 0:
+            return detected
+    except Exception:
+        pass
+
+    try:
+        listing = client.models.list()
+        for item in getattr(listing, "data", []) or []:
+            payload = _to_dict(item)
+            if str(payload.get("id", "")).lower() != model.lower():
+                continue
+            detected = _extract_context_value(payload)
+            if detected > 0:
+                return detected
+            break
+    except Exception:
+        pass
+
+    return 0
+
+
+def remember_context_window(model: str, context_window: int, base_url: str | None = None) -> int:
+    if not model or context_window <= 0:
+        return 0
+    _load_cache()
+    key = _cache_key(model, base_url)
+    existing = _DETECTED_WINDOWS.get(key, 0)
+    if context_window <= existing:
+        return existing
+    _DETECTED_WINDOWS[key] = context_window
+    _save_cache()
+    return context_window
+
+
+def get_context_window(model: str, config_override: int = 0, client=None, base_url: str | None = None) -> int:
+    """返回指定模型的上下文窗口大小（token 数）。"""
     if config_override and config_override > 0:
         return config_override
 
-    # 精确匹配
-    if model in _KNOWN_CONTEXT_WINDOWS:
-        return _KNOWN_CONTEXT_WINDOWS[model]
+    _load_cache()
+    key = _cache_key(model, base_url)
+    cached = _DETECTED_WINDOWS.get(key, 0)
+    if cached > 0:
+        return cached
 
-    # 前缀匹配（处理带日期/版本后缀的模型名，如 qwen3.6-flash-2026-04-16）
-    model_lower = model.lower()
-    for known, size in _KNOWN_CONTEXT_WINDOWS.items():
-        if model_lower.startswith(known.lower()):
-            return size
+    detected = _detect_from_metadata(model, client=client)
+    if detected > 0:
+        return remember_context_window(model, detected, base_url=base_url)
 
     return _DEFAULT

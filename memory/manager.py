@@ -2,6 +2,8 @@ import os
 import threading
 from typing import Optional
 
+from agent.skill_registry import _extract_match_terms, _normalize_skill_text
+
 # 禁用 mem0 遥测（避免 atexit 时 posthog 关闭报错）
 os.environ["MEM0_TELEMETRY"] = "False"
 
@@ -117,6 +119,123 @@ class MemoryManager:
         except Exception as e:
             print(f"[MemoryManager] add 失败：{e}")
 
+    @staticmethod
+    def _dedupe_text_items(items: list[str], limit: int = 12, max_chars: int = 240) -> list[str]:
+        result = []
+        seen = set()
+        for item in items:
+            text = " ".join((item or "").split()).strip()
+            if not text:
+                continue
+            text = text[:max_chars]
+            if text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _score_episodic_candidate(query: str, text: str, source: str = "", base_score: float = 0.0) -> float:
+        normalized_query = _normalize_skill_text(query)
+        normalized_text = _normalize_skill_text(text)
+        if not normalized_query or not normalized_text:
+            return base_score
+
+        score = float(base_score)
+        query_terms = _extract_match_terms(normalized_query)[:18]
+        priority_terms = []
+        for raw_line in (query or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(("当前步骤：", "最近工作结论：", "最近用户问题：")):
+                _, _, value = line.partition("：")
+                priority_terms.extend(_extract_match_terms(value))
+        priority_terms = priority_terms[:12]
+
+        if normalized_text in normalized_query or normalized_query in normalized_text:
+            score += 3.5
+
+        for term in query_terms:
+            if term not in normalized_text:
+                continue
+            if len(term) >= 6:
+                score += 2.2
+            elif len(term) >= 4:
+                score += 1.6
+            else:
+                score += 0.9
+
+        for term in priority_terms:
+            if term not in normalized_text:
+                continue
+            if len(term) >= 4:
+                score += 2.6
+            else:
+                score += 1.5
+
+        if text.startswith("步骤结论:"):
+            score += 1.6
+        elif text.startswith("工作结论:"):
+            score += 2.1
+        elif text.startswith("当前步骤:"):
+            score += 1.1
+        elif text.startswith("用户约束:"):
+            score -= 0.4
+        elif text.startswith("任务目标:"):
+            score -= 1.2
+
+        if source.startswith("step_summary"):
+            score += 0.8
+        elif source == "pre_compress":
+            score += 0.4
+
+        return score
+
+    def _rerank_episodic_memories(self, query: str, memories: list, top_k: int) -> list[str]:
+        scored = []
+        for index, item in enumerate(memories):
+            text = item.get("memory", "") or item.get("text", "")
+            if not text:
+                continue
+            metadata = item.get("metadata") or {}
+            raw_score = item.get("score")
+            try:
+                base_score = float(raw_score)
+            except (TypeError, ValueError):
+                base_score = 0.0
+            score = self._score_episodic_candidate(query, text, metadata.get("source", ""), base_score)
+            scored.append((score, index, text))
+
+        scored.sort(key=lambda row: (-row[0], row[1]))
+        pinned_prefixes = ("任务目标:", "用户约束:")
+        execution_prefixes = ("步骤结论:", "工作结论:", "当前步骤:", "已完成步骤:")
+        has_execution_items = any(text.startswith(execution_prefixes) for _, _, text in scored)
+        primary = []
+        fallback = []
+        for _, _, text in scored:
+            if has_execution_items and text.startswith(pinned_prefixes):
+                fallback.append(text)
+            else:
+                primary.append(text)
+        ranked_texts = primary if has_execution_items and len(primary) >= top_k else primary + fallback
+        return self._dedupe_text_items(ranked_texts, limit=top_k, max_chars=320)
+
+    def add_episodic_records(self, records: list[str], user_id: str = "default", source: str = "runtime"):
+        """将宿主管理的结构化事实项写入 Layer2，避免把长原始消息整段写入向量记忆。"""
+        if not self.available:
+            return
+        normalized = self._dedupe_text_items(records)
+        if not normalized:
+            return
+        try:
+            messages = [{"role": "assistant", "content": text} for text in normalized]
+            self._mem0.add(messages, user_id=user_id, metadata={"layer": "episodic", "source": source[:40]})
+        except Exception as e:
+            print(f"[MemoryManager] add_episodic_records 失败：{e}")
+
     def save_core(self, key: str, value: str, user_id: str = "default"):
         """显式保存 Layer1 核心记忆。
 
@@ -188,9 +307,10 @@ class MemoryManager:
         if not self.available or not query.strip():
             return []
         try:
-            results = self._mem0.search(query, filters={"user_id": user_id, "layer": "episodic"}, top_k=top_k)
+            fetch_k = max(top_k * 3, top_k + 3)
+            results = self._mem0.search(query, filters={"user_id": user_id, "layer": "episodic"}, top_k=fetch_k)
             memories = results if isinstance(results, list) else results.get("results", [])
-            return [m.get("memory", "") or m.get("text", "") for m in memories if m.get("memory") or m.get("text")]
+            return self._rerank_episodic_memories(query, memories, top_k)
         except Exception as e:
             print(f"[MemoryManager] search_episodic 失败：{e}")
             return []
@@ -214,6 +334,17 @@ class MemoryManager:
         t = threading.Thread(
             target=self.add,
             args=(messages, user_id, "episodic"),
+            daemon=True,
+        )
+        t.start()
+
+    def extract_async_records(self, records: list[str], user_id: str = "default", source: str = "runtime"):
+        """后台异步写入结构化情节记忆。"""
+        if not self.available:
+            return
+        t = threading.Thread(
+            target=self.add_episodic_records,
+            args=(records, user_id, source),
             daemon=True,
         )
         t.start()

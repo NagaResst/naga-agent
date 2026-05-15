@@ -56,6 +56,14 @@ system_prompt_file = "generated_scripts/my_personality_prompt.txt"
 context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
 compress_threshold = 0.95         # 超过上下文窗口的此比例时触发压缩管线
 tool_output_max_chars = 300       # 旧轮次工具输出最大保留字符数
+runtime_state_max_chars = 1800    # 固定约束与运行状态 system 块的最大字符数
+runtime_tool_events_max_items = 6 # 运行状态中最多保留多少条最近工具动作
+runtime_findings_max_items = 6    # 运行状态中最多保留多少条最近已验证结果
+runtime_read_skill_files_max_items = 8 # 运行状态中最多保留多少条已读取 skill 资源
+runtime_working_set_max_items = 8 # 运行状态中最多保留多少条跨轮次工作结论
+runtime_completed_steps_max_items = 8 # 运行状态中最多保留多少条已完成步骤
+runtime_constraints_max_items = 10 # 从 skill 中抽取的关键约束最多保留多少条
+runtime_required_outputs_max_items = 8 # 从 skill 中抽取的必需产出最多保留多少条
 # 滑动窗口三档配置（以 user 消息为结尾的完整 turn 数量）
 history_lo_threshold   = 0.30    # token 使用率低于此值时使用 lo 档
 history_keep_turns_lo  = 30      # token < lo_threshold 时保留的 turn 数
@@ -73,6 +81,9 @@ freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
 # 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）
 # 空列表时，由各文件自身 frontmatter 中的 enabled 字段决定
 enabled = []
+match_top_k = 2          # 相关度最高的前 K 个 skill 注入全文
+summary_top_k = 6        # system prompt 中最多展示多少个 skill 摘要
+min_match_score = 2.2    # 命中全文注入的最低相关度分数
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
