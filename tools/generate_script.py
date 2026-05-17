@@ -2,7 +2,6 @@ import os
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["脚本", "生成", "代码", "文件", "shell", "python", "写"],
     "function": {
         "name": "generate_script",
         "description": "在 generated_scripts/ 目录生成脚本文件。",

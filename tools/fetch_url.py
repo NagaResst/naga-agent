@@ -95,7 +95,6 @@ _HTTP_STATUS_MESSAGES = {
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["url", "网页", "抓取", "读取网页", "文档", "http"],
     "function": {
         "name": "fetch_url",
         "description": "访问 URL，返回页面正文纯文本（自动过滤噪音）。",

@@ -2,7 +2,6 @@ import os
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["文件", "编辑", "修改", "替换", "写入", "代码", "配置"],
     "function": {
         "name": "edit_file",
         "description": "对文件做精确字符串替换（old_string 须唯一匹配，含空格换行）。",

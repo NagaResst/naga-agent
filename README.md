@@ -4,13 +4,13 @@
 
 ## 特性
 
-- **模型无关**：连接任意 OpenAI 兼容接口（OpenAI、Anthropic、DeepSeek、Qwen、本地 Ollama 等）
+- **模型无关**：连接任意 OpenAI 兼容接口（OpenAI、Anthropic、DeepSeek、Qwen、MiniMax、本地 Ollama 等）
 - **智能路由**：根据任务复杂度自动选择 low / medium / high 档模型，节省费用
 - **工具调用**：Shell 命令执行、文件读写编辑、脚本生成、网页搜索与抓取、记忆管理
 - **三层记忆**：SQLite 核心记忆 + mem0 向量情节记忆 + 历史摘要，跨会话持久化，无需外部服务
 - **上下文压缩**：零 LLM 调用的机械压缩管线，自动维持 token 预算
 - **Skill 系统**：按需加载 `.md` 格式的专项能力提示词
-- **思维链支持**：透明展示模型推理过程（需模型支持）
+- **思维链支持**：透明展示模型推理过程（支持 MiniMax M2.7 reasoning_split、Qwen enable_thinking 等）
 
 ---
 
@@ -44,6 +44,16 @@ OPENAI_API_KEY=sk-...          # API Key
 OPENAI_BASE_URL=               # 留空使用 OpenAI 官方，填入第三方兼容服务地址
 BOCHA_API_KEY=                 # 博查搜索 API Key，web_search 工具使用
 ```
+
+**MiniMax M2.7 快速配置**：
+
+```env
+OPENAI_API_KEY=your_minimax_api_key
+OPENAI_BASE_URL=https://api.minimaxi.com/v1
+```
+
+当前 `config.toml` 已预配置 MiniMax M2.7 作为默认模型，支持 reasoning_split 思维链拆分。
+详见 [MINIMAX_SETUP.md](MINIMAX_SETUP.md) 和 [QUICKSTART_MINIMAX.md](QUICKSTART_MINIMAX.md)。
 
 **2. 模型与行为配置**（`config.toml`）
 

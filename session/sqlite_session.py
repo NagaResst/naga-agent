@@ -41,9 +41,13 @@ class SessionManager:
                 session_id TEXT NOT NULL,
                 role       TEXT NOT NULL,
                 content    TEXT NOT NULL,
+                metadata   TEXT DEFAULT NULL,
                 timestamp  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            
+            -- 迁移：为已存在的表添加 metadata 字段
+            ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL;
             CREATE TABLE IF NOT EXISTS token_usage (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -112,16 +116,26 @@ class SessionManager:
     def get_history(self, session_id: str) -> list:
         conn = self._conn()
         rows = conn.execute(
-            "SELECT role, content, timestamp FROM messages WHERE session_id = ? ORDER BY id",
+            "SELECT role, content, metadata, timestamp FROM messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         ).fetchall()
-        return [{"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]} for r in rows]
+        result = []
+        for r in rows:
+            msg = {"role": r["role"], "content": r["content"], "timestamp": r["timestamp"]}
+            if r["metadata"]:
+                try:
+                    msg.update(json.loads(r["metadata"]))
+                except Exception:
+                    pass
+            result.append(msg)
+        return result
 
-    def append_message(self, session_id: str, role: str, content: str):
+    def append_message(self, session_id: str, role: str, content: str, metadata: dict = None):
         conn = self._conn()
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, datetime.now().isoformat()),
+            "INSERT INTO messages (session_id, role, content, metadata, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, metadata_json, datetime.now().isoformat()),
         )
         conn.commit()
 

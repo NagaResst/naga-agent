@@ -42,7 +42,6 @@ def _detect_file_type(path: str) -> str:
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["文件", "读取", "查看", "代码", "日志", "配置", "内容"],
     "function": {
         "name": "read_file",
         "description": "读取本地文件内容，支持按行范围读取。",

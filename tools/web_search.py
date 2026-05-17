@@ -29,7 +29,6 @@ BOCHA_SEARCH_URL = "https://api.bochaai.com/v1/web-search"
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["搜索", "查询", "查找", "天气", "新闻", "网络", "互联网", "了解", "最新", "资讯"],
     "function": {
         "name": "web_search",
         "description": "联网搜索。摘要不足时用 fetch_url 读原文，勿连续重复搜索同一主题。",

@@ -775,7 +775,11 @@ class Agent:
             if message.get("role") == "system" and self._RUNTIME_STATE_MARKER in (message.get("content") or ""):
                 message["content"] = state_block
                 return
-        messages.insert(0, {"role": "system", "content": state_block})
+        # MiniMax 不支持多个 system 消息，合并到第一个
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = state_block + "\n\n" + messages[0]["content"]
+        else:
+            messages.insert(0, {"role": "system", "content": state_block})
 
     def _build_skill_prompt_block(self, skill: dict) -> str:
         directive = (
@@ -1126,16 +1130,11 @@ class Agent:
         use_merge = skill_layer_mode == "merge" or (skill_full_content and self._skill_layer_merged)
 
         if main_system.strip():
-            if use_merge and skill_full_content:
-                # 降级模式：拼接到主层末尾
+            # MiniMax 不支持多个 system 消息，强制合并
+            if skill_full_content:
                 merged = main_system + "\n\n" + skill_full_content
                 raw_messages.insert(0, {"role": "system", "content": merged.strip()})
-            elif use_multi_system:
-                # 双 system 消息模式
-                raw_messages.insert(0, {"role": "system", "content": skill_full_content.strip()})
-                raw_messages.insert(0, {"role": "system", "content": main_system.strip()})
             else:
-                # 无命中 skill / merge 已禁用
                 raw_messages.insert(0, {"role": "system", "content": main_system.strip()})
 
         return raw_messages

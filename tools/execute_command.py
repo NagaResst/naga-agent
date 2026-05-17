@@ -45,7 +45,6 @@ def _truncate_output(text: str, max_chars: int) -> str:
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["命令", "shell", "执行", "安装", "运行", "脚本", "终端", "系统", "进程", "部署"],
     "function": {
         "name": "execute_command",
         "description": "执行本地 Shell 命令。",

@@ -13,20 +13,29 @@ def set_agent(agent):
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["skill", "技能", "加载", "移除", "扫描"],
     "function": {
         "name": "skill_manager",
         "description": "管理 Skill：load=加载外部skill文件/目录，remove=删除，reload=重扫描。",
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["load", "remove", "reload"], "description": "操作类型"},
-                "source_path": {"type": "string", "description": "load：外部 .md 文件或 skill 目录路径"},
-                "name": {"type": "string", "description": "remove：skill 名称"},
+                "action": {
+                    "type": "string",
+                    "enum": ["load", "remove", "reload"],
+                    "description": "操作类型"
+                },
+                "source_path": {
+                    "type": "string",
+                    "description": "load：外部 .md 文件或 skill 目录路径"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "remove：skill 名称"
+                }
             },
-            "required": ["action"],
-        },
-    },
+            "required": ["action"]
+        }
+    }
 }
 
 
@@ -61,10 +70,18 @@ def execute(args: dict) -> str:
                 return f"错误：目录中未找到 SKILL.md：{source_path}"
             dirname = os.path.basename(source_path.rstrip("/"))
             dest_path = os.path.join(_agent._skills_dir, dirname)
-            overwritten = os.path.isdir(dest_path)
-            if overwritten:
+            
+            # 如果目标已存在，先删除（可能是旧文件或旧链接）
+            if os.path.islink(dest_path):
+                os.unlink(dest_path)
+            elif os.path.isdir(dest_path):
                 shutil.rmtree(dest_path)
-            shutil.copytree(source_path, dest_path)
+            elif os.path.isfile(dest_path):
+                os.remove(dest_path)
+            
+            # 创建软连接到源目录
+            os.symlink(os.path.abspath(source_path), dest_path)
+            
             # 从 SKILL.md frontmatter 读取 skill name
             try:
                 with open(skill_md, "r", encoding="utf-8") as f:
@@ -76,8 +93,16 @@ def execute(args: dict) -> str:
         else:
             filename = os.path.basename(source_path)
             dest_path = os.path.join(_agent._skills_dir, filename)
-            overwritten = os.path.isfile(dest_path)
-            shutil.copy2(source_path, dest_path)
+            
+            # 如果目标已存在，先删除（可能是旧文件或旧链接）
+            if os.path.islink(dest_path):
+                os.unlink(dest_path)
+            elif os.path.isfile(dest_path):
+                os.remove(dest_path)
+            
+            # 创建软连接到源文件
+            os.symlink(os.path.abspath(source_path), dest_path)
+            
             try:
                 with open(dest_path, "r", encoding="utf-8") as f:
                     content = f.read()
@@ -92,9 +117,10 @@ def execute(args: dict) -> str:
         _agent.reload_skills()
 
         active = [s["name"] for s in _agent._skills if s["enabled"]]
-        action_word = "已覆盖更新" if overwritten else "已加载"
         return (
-            f"{action_word} skill：{skill_name}（来源：{source_path}）\n"
+            f"已创建软连接加载 skill：{skill_name}\n"
+            f"  源路径：{source_path}\n"
+            f"  链接位置：{dest_path}\n"
             f"当前已加载 {len(_agent._skills)} 个 skill，激活：{active or '无'}"
         )
 
@@ -106,8 +132,13 @@ def execute(args: dict) -> str:
         target_file = os.path.join(_agent._skills_dir, f"{name}.md")
         target_dir = os.path.join(_agent._skills_dir, name)
 
-        if os.path.isfile(target_file):
+        # 优先检查是否为软连接
+        if os.path.islink(target_file):
+            os.unlink(target_file)  # 删除软连接，不影响原文件
+        elif os.path.isfile(target_file):
             os.remove(target_file)
+        elif os.path.islink(target_dir):
+            os.unlink(target_dir)  # 删除软连接，不影响原目录
         elif os.path.isdir(target_dir):
             shutil.rmtree(target_dir)
         else:

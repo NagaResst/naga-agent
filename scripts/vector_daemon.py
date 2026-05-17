@@ -225,7 +225,7 @@ if __name__ == "__main__":
 
     # 设置 PyTorch 计算线程数
     import torch
-    thread_count = args.cpu_threads if args.cpu_threads > 0 else (os.cpu_count() or 12)
+    thread_count = int(args.cpu_threads if args.cpu_threads > 0 else (os.cpu_count() or 12)/2)
     torch.set_num_threads(thread_count)
     print(f"[启动] CPU 线程数: {thread_count}", flush=True)
 

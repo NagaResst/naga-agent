@@ -10,7 +10,6 @@ def set_memory_manager(mm):
 
 TOOL_DEFINITION = {
     "type": "function",
-    "tags": ["记忆", "记录", "保存", "知识库", "文档导入", "搜索记忆", "删除记忆"],
     "function": {
         "name": "memory",
         "description": "持久化记忆。save/recall/list/delete=核心记忆；add_document/forget=知识库；search=语义搜索。",

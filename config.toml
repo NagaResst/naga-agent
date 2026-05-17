@@ -2,15 +2,14 @@
 db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
-default = "gpt-5.4"
-available = ["gpt-5.4-mini", "gpt-5.4"]
-base_url = "" 
+default = "MiniMax-M2.7"
+available = ["MiniMax-M2.7"]
+base_url = "https://api.minimaxi.com/v1" 
 
 # 费用等级标记：low / medium / high
 # 同一 tier 有多个模型时，available 列表中靠后的优先
 [model.tiers]
-"gpt-5.4-mini" = "low"
-"gpt-5.4"      = "high"
+"MiniMax-M2.7"      = "high"
 # 通用扩展参数：对所有模型生效，模型专属参数（extra_params.<model>）会覆盖此处同名字段
 "qwen3.6-flash"            = "low"
 "qwen3.6-flash-2026-04-16" = "low"
@@ -23,9 +22,16 @@ base_url = ""
 enable_thinking = true
 thinking_budget = 4000
 
+# MiniMax M2.7 系列配置：启用 reasoning_split 将思考内容分离到 reasoning_details 字段
+[model.extra_params."MiniMax-M2.7"]
+reasoning_split = true
+
+[model.extra_params."MiniMax-M2.7-highspeed"]
+reasoning_split = true
+
 [routing]
-enabled = true
-classifier_model = "gpt-5.4-mini"
+enabled = false
+classifier_model = "MiniMax-M2.7"
 show_routing_decision = true
 
 # 路由结果映射到费用等级（low/medium/high），不绑定具体模型名
@@ -48,7 +54,7 @@ max_history = 50
 auto_confirm = true
 scripts_subdir = "generated_scripts"
 temperature = 0.7
-top_p = 0.8
+top_p = 0.9
 show_thinking = true
 enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
 prompt_prefix = "你"
@@ -98,7 +104,7 @@ episodic_top_k = 3
 # Layer1 核心记忆全量注入 system prompt 的最大条数
 core_max_items = 20
 # mem0 内部提取记忆时使用的 LLM（需与 [model].base_url 接入点兼容）
-llm_model = "gpt-5.4-mini"
+llm_model = "MiniMax-M2.7"
 
 [memory.embedder]
 # 嵌入模型：通过本地 Daemon 的 OpenAI 兼容接口（bge-base-zh-v1.5, 768 维）
