@@ -45,9 +45,6 @@ class SessionManager:
                 timestamp  TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-            
-            -- 迁移：为已存在的表添加 metadata 字段
-            ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL;
             CREATE TABLE IF NOT EXISTS token_usage (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -56,13 +53,21 @@ class SessionManager:
             CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
             CREATE TABLE IF NOT EXISTS summaries (
                 session_id TEXT PRIMARY KEY,
-                text       TEXT NOT NULL DEFAULT ''
+                text       TEXT NOT NULL DEFAULT '',
+                last_message_id INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS memories (
-                key   TEXT PRIMARY KEY,
-                value TEXT NOT NULL DEFAULT ''
+                id         TEXT PRIMARY KEY,
+                content    TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT ''
             );
         """)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "metadata" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL")
+        summary_columns = {row["name"] for row in conn.execute("PRAGMA table_info(summaries)")}
+        if "last_message_id" not in summary_columns:
+            conn.execute("ALTER TABLE summaries ADD COLUMN last_message_id INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
     # ── 会话管理 ──────────────────────────────────────────────────────────
@@ -130,6 +135,25 @@ class SessionManager:
             result.append(msg)
         return result
 
+    def get_history_since(self, session_id: str, after_id: int = 0) -> list[dict]:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id, role, content, metadata FROM messages "
+            "WHERE session_id = ? AND id > ? ORDER BY id", (session_id, after_id),
+        ).fetchall()
+        result = []
+        for row in rows:
+            message = {"id": row["id"], "role": row["role"], "content": row["content"]}
+            if row["metadata"]:
+                try:
+                    metadata = json.loads(row["metadata"])
+                    if isinstance(metadata, dict):
+                        message.update({key: metadata[key] for key in ("tool_calls", "tool_call_id", "name") if key in metadata})
+                except (ValueError, TypeError):
+                    pass
+            result.append(message)
+        return result
+
     def append_message(self, session_id: str, role: str, content: str, metadata: dict = None):
         conn = self._conn()
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
@@ -139,9 +163,24 @@ class SessionManager:
         )
         conn.commit()
 
+    def append_messages(self, session_id: str, messages: list[dict]):
+        conn = self._conn()
+        timestamp = datetime.now().isoformat()
+        with conn:
+            conn.executemany(
+                "INSERT INTO messages (session_id, role, content, metadata, timestamp) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (session_id, message["role"], message.get("content") or "",
+                     json.dumps({key: message[key] for key in ("tool_calls", "tool_call_id", "name") if key in message},
+                                ensure_ascii=False), timestamp)
+                    for message in messages
+                ],
+            )
+
     def clear_messages(self, session_id: str):
         conn = self._conn()
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
         conn.commit()
 
     # ── Token 用量 ──────────────────────────────────────────────────────────
@@ -186,30 +225,45 @@ class SessionManager:
         )
         conn.commit()
 
-    # ── 跨会话 KV 记忆（Layer1 持久化存储）──────────────────────────
+    def get_summary_record(self, session_id: str) -> dict:
+        row = self._conn().execute(
+            "SELECT text, last_message_id FROM summaries WHERE session_id = ?", (session_id,),
+        ).fetchone()
+        return {"text": row["text"], "last_message_id": row["last_message_id"]} if row else {
+            "text": "", "last_message_id": 0,
+        }
 
-    def set_memory(self, key: str, value: str):
+    def set_summary_record(self, session_id: str, text: str, last_message_id: int):
         conn = self._conn()
         conn.execute(
-            "INSERT INTO memories (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
+            "INSERT INTO summaries (session_id, text, last_message_id) VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET text = excluded.text, "
+            "last_message_id = excluded.last_message_id "
+            "WHERE excluded.last_message_id >= summaries.last_message_id",
+            (session_id, text, last_message_id),
         )
         conn.commit()
 
-    def get_memory(self, key: str) -> str | None:
-        conn = self._conn()
-        row = conn.execute("SELECT value FROM memories WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else None
+    # ── 跨会话 KV 记忆（Layer1 持久化存储）──────────────────────────
 
-    def list_memories(self) -> dict:
+    def save_memory(self, memory_id: str, content: str):
         conn = self._conn()
-        rows = conn.execute("SELECT key, value FROM memories").fetchall()
-        return {row["key"]: row["value"] for row in rows}
+        from datetime import datetime
+        conn.execute(
+            "INSERT INTO memories (id, content, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+            (memory_id, content, datetime.now().isoformat()),
+        )
+        conn.commit()
 
-    def delete_memory(self, key: str):
+    def list_memories(self) -> list[dict]:
         conn = self._conn()
-        conn.execute("DELETE FROM memories WHERE key = ?", (key,))
+        rows = conn.execute("SELECT id, content, created_at FROM memories ORDER BY created_at").fetchall()
+        return [{"id": row["id"], "content": row["content"], "created_at": row["created_at"]} for row in rows]
+
+    def delete_memory(self, memory_id: str):
+        conn = self._conn()
+        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         conn.commit()
 
     # ── 关闭连接 ──────────────────────────────────────────────────────

@@ -62,8 +62,7 @@ def load_config() -> dict:
     extra_params = model_section.get("extra_params", {})
     extra_params_default = dict(model_section.get("extra_params_default", {}))
 
-    routing_section = toml_config.get("routing", {})
-    routing_map = routing_section.get("model_map", {"simple": "low", "medium": "medium", "complex": "high"})
+    delegation_section = toml_config.get("delegation", {})
 
     tools_section = toml_config.get("tools", {})
 
@@ -90,12 +89,15 @@ def load_config() -> dict:
             "extra_params": extra_params,
             "extra_params_default": extra_params_default,
         },
-        "routing": {
-            "enabled": routing_section.get("enabled", False),
-            "classifier_model": routing_section.get("classifier_model", "qwen-turbo"),
-            "show_routing_decision": routing_section.get("show_routing_decision", True),
-            "model_map": routing_map,
-            "tier_to_model": tier_to_model,
+        "delegation": {
+            "enabled": delegation_section.get("enabled", False),
+            "model": os.environ.get("SUBAGENT_MODEL") or delegation_section.get("model", ""),
+            "base_url": os.environ.get("SUBAGENT_BASE_URL") or delegation_section.get("base_url", ""),
+            "api_key": os.environ.get("SUBAGENT_API_KEY", ""),
+            "max_tasks": max(1, min(10, delegation_section.get("max_tasks", 3))),
+            "max_rounds": max(0, min(10, delegation_section.get("max_rounds", 3))),
+            "max_calls": max(1, min(10, delegation_section.get("max_calls", 2))),
+            "context_token_limit": delegation_section.get("context_token_limit", 0),
         },
         "tools": {
             "command_timeout": tools_section.get("command_timeout", 30),
@@ -103,8 +105,6 @@ def load_config() -> dict:
             "tool_max_retries": tools_section.get("tool_max_retries", 2),
             "tool_max_rounds": tools_section.get("tool_max_rounds", 10),
             "tool_max_errors": tools_section.get("tool_max_errors", 3),
-            "replan_threshold": tools_section.get("replan_threshold", 0.6),
-            "replan_repeat_window": tools_section.get("replan_repeat_window", 3),
         },
         "agent": {
             "max_history": agent_section.get("max_history", 50),
@@ -117,8 +117,8 @@ def load_config() -> dict:
             "prompt_prefix": os.environ.get("AGENT_PROMPT_PREFIX", agent_section.get("prompt_prefix", "🤖")),
             "system_prompt": system_prompt,
             "context_token_limit": agent_section.get("context_token_limit", 0),
-            "compress_threshold": agent_section.get("compress_threshold", 0.60),
-            "tool_output_max_chars": agent_section.get("tool_output_max_chars", 300),
+            "context_compact_ratio": min(0.9, max(0.5, agent_section.get("context_compact_ratio", 0.75))),
+            "tool_result_keep_rounds": max(0, min(10, agent_section.get("tool_result_keep_rounds", 3))),
             "runtime_state_max_chars": agent_section.get("runtime_state_max_chars", 1800),
             "runtime_tool_events_max_items": agent_section.get("runtime_tool_events_max_items", 6),
             "runtime_findings_max_items": agent_section.get("runtime_findings_max_items", 6),

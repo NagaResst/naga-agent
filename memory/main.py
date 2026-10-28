@@ -25,12 +25,9 @@ HELP_TEXT = """
   /thinking off       关闭思维链模式
   /thinking show      显示思考过程
   /thinking hide      隐藏思考过程
-  /search on          开启模型联网搜索
-  /search off         关闭模型联网搜索
-  /model <名称>       切换模型，例如 /model qwen-plus（同时固定模型，跳过路由）
-  /model auto         恢复自动路由模式
-  /routing on         开启智能模型路由
-  /routing off        关闭智能模型路由
+    /model <名称>       切换主模型，例如 /model qwen-plus
+    /model auto         恢复配置中的默认主模型
+    /delegate on/off    开关低成本子任务分派
   /prompt             查看当前系统提示词
   /prompt set <内容>  设置新的系统提示词
   /prompt clear       清除系统提示词
@@ -208,33 +205,28 @@ def main():
             agent.config["agent"]["show_thinking"] = False
             console.print("[green]思考过程显示已关闭[/green]")
 
-        elif user_input == "/search on":
-            console.print("[red]模型联网搜索已禁用（独立计费），请使用 web_search 工具进行搜索。[/red]")
-
-        elif user_input == "/search off":
-            console.print("[red]模型联网搜索已禁用（独立计费），请使用 web_search 工具进行搜索。[/red]")
-
         elif user_input.startswith("/model "):
             new_model = user_input[7:].strip()
             if new_model == "auto":
-                agent._routing_locked = False
-                console.print("[green]已恢复自动路由模式。[/green]")
+                agent.model = config["model"]["default"]
+                console.print(f"[green]已恢复默认主模型：{agent.model}[/green]")
             elif new_model in config["model"]["available"]:
                 agent.model = new_model
-                agent._manual_model = new_model
-                agent._routing_locked = True
-                console.print(f"[green]模型已固定为：{new_model}（已跳过自动路由）[/green]")
+                console.print(f"[green]主模型已切换为：{new_model}[/green]")
             else:
                 console.print(f"[red]不支持的模型：{new_model}[/red]")
                 console.print(f"可用模型：{', '.join(config['model']['available'])}")
 
-        elif user_input == "/routing on":
-            agent.config["routing"]["enabled"] = True
-            console.print("[green]智能模型路由已开启[/green]")
+        elif user_input == "/delegate on":
+            if agent._subtask_runner is None:
+                console.print("[yellow]低成本子模型未配置或无法连接，无法开启分派。[/yellow]")
+                continue
+            agent.config["delegation"]["enabled"] = True
+            console.print("[green]子任务分派已开启[/green]")
 
-        elif user_input == "/routing off":
-            agent.config["routing"]["enabled"] = False
-            console.print("[green]智能模型路由已关闭（固定使用当前模型）[/green]")
+        elif user_input == "/delegate off":
+            agent.config["delegation"]["enabled"] = False
+            console.print("[green]子任务分派已关闭[/green]")
 
         elif user_input == "/token":
             summary = agent.get_token_summary()
@@ -295,7 +287,7 @@ def main():
             console.print(f"当前模型：{agent.model}")
             console.print(f"消息总数：{len(history)}")
             console.print(f"自动确认：{'是' if agent.auto_confirm else '否'}")
-            console.print(f"模型路由：{'开启' if agent.config.get('routing', {}).get('enabled') else '关闭'}")
+            console.print(f"子任务分派：{'开启' if agent.config.get('delegation', {}).get('enabled') and agent._subtask_runner else '关闭'}")
             console.print(f"系统提示词：{current_prompt[:80] or '[未设置]'}{'...' if len(current_prompt) > 80 else ''}")
             if summary.get("turns", 0) > 0:
                 console.print(
@@ -361,6 +353,9 @@ def main():
                 console.print(f"[dim]Skill \'{name}\' 已停用。[/dim]")
             else:
                 console.print(f"[red]未找到 skill：{name}，请用 /skill list 查看可用列表。[/red]")
+
+        elif user_input.startswith("/"):
+            console.print("[yellow]未知命令，输入 /help 查看可用命令。[/yellow]")
 
         else:
             try:

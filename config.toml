@@ -2,55 +2,27 @@
 db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
-default = "MiniMax-M2.7"
-available = ["MiniMax-M2.7"]
-base_url = "https://api.minimaxi.com/v1" 
+default = "GLM-5.3-Coding"
+available = ["GLM-5.3-Coding"]
+base_url = "https://api-opensource-ai.mde.rakuten-it.com/v1" 
 
-# 费用等级标记：low / medium / high
-# 同一 tier 有多个模型时，available 列表中靠后的优先
-[model.tiers]
-"MiniMax-M2.7"      = "high"
-# 通用扩展参数：对所有模型生效，模型专属参数（extra_params.<model>）会覆盖此处同名字段
-"qwen3.6-flash"            = "low"
-"qwen3.6-flash-2026-04-16" = "low"
-"qwen3.6-plus"             = "medium"
-"qwen3.6-max-preview"      = "high"
 
-# 模型专属扩展参数，注入 API 请求的 extra_body（仅部分供应商支持）
-# 示例：为 Qwen3 系列配置思维链参数
-[model.extra_params."qwen3.6-flash"]
-enable_thinking = true
-thinking_budget = 4000
-
-# MiniMax M2.7 系列配置：启用 reasoning_split 将思考内容分离到 reasoning_details 字段
-[model.extra_params."MiniMax-M2.7"]
-reasoning_split = true
-
-[model.extra_params."MiniMax-M2.7-highspeed"]
-reasoning_split = true
-
-[routing]
-enabled = false
-classifier_model = "MiniMax-M2.7"
-show_routing_decision = true
-
-# 路由结果映射到费用等级（low/medium/high），不绑定具体模型名
-[routing.model_map]
-simple  = "low"
-medium  = "high"
-complex = "high"
-plan    = "high"
+[delegation]
+enabled = true
+model = "DeepSeek-V4.1-Flash"              # 低成本子模型名；也可设置 SUBAGENT_MODEL
+max_tasks = 3            # 单次调用最多分派几个独立任务
+max_rounds = 3           # 每个子 Agent 最多调用几轮只读工具
+max_calls = 2            # 单轮主对话最多分派几次
+context_token_limit = 0 # 子模型窗口；0=按元数据自动探测
 
 [tools]
 command_timeout = 30       # execute_command 超时秒数
 output_max_chars = 3000    # 工具返回结果最大字符数
 tool_max_rounds = 90       # 单次对话最大工具调用轮次（防死循环）
 tool_max_errors = 3        # 连续工具错误上限（防错误风暴）
-replan_threshold = 0.8     # 信号B：step 轮次消耗比超此值触发 re-planner
-replan_repeat_window = 3   # 信号C：重复检测滑动窗口大小
 
 [agent]
-max_history = 50
+max_history = 50           # 发送给模型的最多历史消息数；按完整对话轮次裁剪
 auto_confirm = true
 scripts_subdir = "generated_scripts"
 temperature = 0.7
@@ -60,22 +32,14 @@ enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
 prompt_prefix = "你"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
 context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
-compress_threshold = 0.95         # 超过上下文窗口的此比例时触发压缩管线
-tool_output_max_chars = 300       # 旧轮次工具输出最大保留字符数
-runtime_state_max_chars = 1800    # 固定约束与运行状态 system 块的最大字符数
+context_compact_ratio = 0.75      # 已用输入达到此比例时归档完整旧轮次
+tool_result_keep_rounds = 3       # 仅最近 3 批工具调用及其结果进入上下文
+runtime_state_max_chars = 1800    # 运行参考状态的最大字符数
 runtime_tool_events_max_items = 6 # 运行状态中最多保留多少条最近工具动作
 runtime_findings_max_items = 6    # 运行状态中最多保留多少条最近已验证结果
 runtime_read_skill_files_max_items = 8 # 运行状态中最多保留多少条已读取 skill 资源
-runtime_working_set_max_items = 8 # 运行状态中最多保留多少条跨轮次工作结论
-runtime_completed_steps_max_items = 8 # 运行状态中最多保留多少条已完成步骤
-runtime_constraints_max_items = 10 # 从 skill 中抽取的关键约束最多保留多少条
-runtime_required_outputs_max_items = 8 # 从 skill 中抽取的必需产出最多保留多少条
-# 滑动窗口三档配置（以 user 消息为结尾的完整 turn 数量）
-history_lo_threshold   = 0.30    # token 使用率低于此值时使用 lo 档
-history_keep_turns_lo  = 30      # token < lo_threshold 时保留的 turn 数
-history_keep_turns_mid = 10       # lo_threshold ≤ token < compress_threshold 时保留的 turn 数
-history_keep_turns_hi  = 3       # 压缩管线内保留的 turn 数（最少保留最后 2 轮）
-# Skill 层注入模式：auto（首次多 system 失败自动降级）/ multi_system / merge
+runtime_working_set_max_items = 8
+runtime_completed_steps_max_items = 8
 skill_layer_mode = "auto"
 
 [search]
@@ -87,40 +51,44 @@ freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
 # 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）
 # 空列表时，由各文件自身 frontmatter 中的 enabled 字段决定
 enabled = []
-match_top_k = 2          # 相关度最高的前 K 个 skill 注入全文
-summary_top_k = 6        # system prompt 中最多展示多少个 skill 摘要
-min_match_score = 2.2    # 命中全文注入的最低相关度分数
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
-# 向量库后端：统一使用 Qdrant server
+# 向量库后端
 backend = "qdrant"
-# 每 N 轮对话后触发一次记忆提取；0 = 仅会话结束时触发
-extract_every_n_turns = 3
-# 触发提取的最小内容字符数（避免短消息浪费）
-min_content_length = 20
-# Layer2 情节记忆语义检索返回条数
-episodic_top_k = 3
-# Layer1 核心记忆全量注入 system prompt 的最大条数
+agent_id = "naga-agent"  # mem0 情景记忆跨会话共享的归属 ID，修改后旧作用域不可见
+# Layer1 核心记忆
 core_max_items = 20
-# mem0 内部提取记忆时使用的 LLM（需与 [model].base_url 接入点兼容）
-llm_model = "MiniMax-M2.7"
+core_max_chars = 200
+# Layer2 情景记忆 — 自动提取
+extract_every_n_turns = 10   # 0=不启用
+extract_history_turns = 20
+# 检索
+episodic_search_k = 15
+episodic_inject_k = 5
+# mem0 内部提取使用的 LLM
+llm_model = "DeepSeek-V4.1-Flash"
 
 [memory.embedder]
-# 嵌入模型：通过本地 Daemon 的 OpenAI 兼容接口（bge-base-zh-v1.5, 768 维）
-model = "bge-base-zh-v1.5"
-base_url = "http://127.0.0.1:8000/v1"
-api_key = "daemon"
+model = "Qwen3-Embedding-8B"
+base_url = "https://api-opensource-ai.mde.rakuten-it.com/v1"
+# VECTOR_API_KEY 环境变量优先；未设置时复用主模型 OPENAI_API_KEY。
 
-# Qdrant server 配置（mem0 集合="mem0"，手动记忆集合="memories"）
+[memory.reranker]
+model = "Qwen3-Reranker-8B"
+base_url = "https://api-opensource-ai.mde.rakuten-it.com/v1"
+timeout = 10
+
 [memory.qdrant]
 host = "localhost"
 port = 6333
+embedding_dims = 4096
+collection_name = "mem0_qwen3_embedding_8b"  # 与旧的 768 维 mem0 集合隔离
 
 # ── 本地嵌入 Daemon ─────────────────────────────────────────────────────────
 [embedding_daemon]
 # Daemon 脚本路径（启动时自动 fork 子进程）
-script_path = "scripts/vector_daemon.py"
+script_path = ""  # 使用远程 Embedding，不启动本地模型下载
 host = "127.0.0.1"
 port = 8000
 # CPU 计算线程数（0 = 自动检测全部核心，默认 PyTorch 只用一半）

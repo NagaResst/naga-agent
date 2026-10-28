@@ -4,11 +4,11 @@
     1. config 手动指定（context_token_limit > 0）
     2. 本地持久化缓存 / 进程内缓存（仅接受远端 metadata 已确认的值）
     3. provider models 元数据中的上下文字段
-    4. 默认值 200000（200k）
+    4. 未知模型的默认回退值 131072（128k）
 
 说明：
     - 不允许基于模型名、usage、报错文本做推断。
-    - 如果远端 models 接口不暴露上下文窗口，就只能回退到保守默认值或由用户手动覆盖。
+    - 如果远端 models 接口不暴露上下文窗口，就只能回退到默认值或由用户手动覆盖。
 """
 
 from __future__ import annotations
@@ -16,13 +16,18 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from typing import Any
 
-_DEFAULT = 200000  # 200k，未知模型时的保守回退值
+_DEFAULT = 131072
 _CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".context_window_cache.json")
 _CACHE_LOCK = threading.Lock()
 _CACHE_LOADED = False
 _DETECTED_WINDOWS: dict[str, int] = {}
+_DETECTED_AT: dict[str, float] = {}
+_PROBED_WINDOWS: dict[str, float] = {}
+_FAILED_PROBE_TTL = 60
+_POSITIVE_CACHE_TTL = 86400
 
 _CONTEXT_KEYS = (
     "context_window",
@@ -62,6 +67,7 @@ def _load_cache():
                             window = value.get("context_window", 0)
                             if source == "remote_metadata" and isinstance(window, int) and window > 0:
                                 _DETECTED_WINDOWS[key] = window
+                                _DETECTED_AT[key] = value.get("checked_at", 0)
             except Exception:
                 pass
         _CACHE_LOADED = True
@@ -72,7 +78,8 @@ def _save_cache():
         try:
             with open(_CACHE_FILE, "w", encoding="utf-8") as f:
                 payload = {
-                    key: {"context_window": value, "source": "remote_metadata"}
+                    key: {"context_window": value, "source": "remote_metadata",
+                          "checked_at": _DETECTED_AT.get(key, 0)}
                     for key, value in _DETECTED_WINDOWS.items()
                     if isinstance(value, int) and value > 0
                 }
@@ -146,10 +153,9 @@ def remember_context_window(model: str, context_window: int, base_url: str | Non
         return 0
     _load_cache()
     key = _cache_key(model, base_url)
-    existing = _DETECTED_WINDOWS.get(key, 0)
-    if context_window <= existing:
-        return existing
     _DETECTED_WINDOWS[key] = context_window
+    _DETECTED_AT[key] = time.time()
+    _PROBED_WINDOWS.pop(key, None)
     _save_cache()
     return context_window
 
@@ -162,11 +168,17 @@ def get_context_window(model: str, config_override: int = 0, client=None, base_u
     _load_cache()
     key = _cache_key(model, base_url)
     cached = _DETECTED_WINDOWS.get(key, 0)
-    if cached > 0:
+    if cached > 0 and (client is None or time.time() - _DETECTED_AT.get(key, 0) < _POSITIVE_CACHE_TTL):
         return cached
+
+    if _PROBED_WINDOWS.get(key, 0) > time.monotonic():
+        return cached or _DEFAULT
 
     detected = _detect_from_metadata(model, client=client)
     if detected > 0:
         return remember_context_window(model, detected, base_url=base_url)
 
-    return _DEFAULT
+    if client is not None:
+        _PROBED_WINDOWS[key] = time.monotonic() + _FAILED_PROBE_TTL
+
+    return cached or _DEFAULT

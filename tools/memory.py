@@ -1,4 +1,4 @@
-import os
+"""记忆工具。第一参数 layer（core/episodic），第二参数 action（save/recall/delete/list）。"""
 
 _memory_manager = None
 
@@ -12,144 +12,119 @@ TOOL_DEFINITION = {
     "type": "function",
     "function": {
         "name": "memory",
-        "description": "持久化记忆。save/recall/list/delete=核心记忆；add_document/forget=知识库；search=语义搜索。",
+        "description": "持久化记忆系统。layer=core（核心偏好，全量注入，≤20条/≤200字符）或 layer=episodic（情景记忆，语义检索，无限制）。",
         "parameters": {
             "type": "object",
             "properties": {
+                "layer": {
+                    "type": "string",
+                    "enum": ["core", "episodic"],
+                    "description": "操作哪一层",
+                },
                 "action": {
                     "type": "string",
-                    "enum": ["save", "recall", "list", "delete", "add_document", "forget", "search"],
+                    "enum": ["save", "recall", "delete", "list"],
                     "description": "操作类型",
                 },
-                "key": {"type": "string", "description": "记忆键名（save/recall/delete）"},
-                "value": {"type": "string", "description": "记忆内容（save）"},
-                "path": {"type": "string", "description": "文档路径（add_document）"},
-                "content": {"type": "string", "description": "文档内容（add_document，与path二选一）"},
-                "source": {"type": "string", "description": "文档来源标识（add_document）"},
-                "title_or_source": {"type": "string", "description": "标题或来源（forget）"},
-                "query": {"type": "string", "description": "搜索词（search）"},
-                "scope": {"type": "string", "enum": ["core", "manual", "all"], "description": "搜索范围（默认manual）"},
+                "content": {
+                    "type": "string",
+                    "description": "自然语言内容（save 必填）",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "自然语言查询词（recall 必填）",
+                },
+                "memory_id": {
+                    "type": "string",
+                    "description": "记忆 ID（delete 必填）",
+                },
             },
-            "required": ["action"],
+            "required": ["layer", "action"],
         },
     },
 }
 
 
+def _err(msg: str) -> str:
+    return f"[memory 参数错误] {msg}"
+
+
 def execute(args: dict) -> str:
     if _memory_manager is None:
-        return "错误：记忆工具未初始化（memory_manager 未注入）。"
+        return "错误：记忆系统未初始化"
 
-    action = args.get("action", "").strip()
+    layer = (args.get("layer") or "").strip()
+    action = (args.get("action") or "").strip()
+
+    # ── 参数校验 ────────────────────────────────────────────
+
+    if layer not in ("core", "episodic"):
+        return _err('layer 必须是 "core" 或 "episodic"')
+
+    if action not in ("save", "recall", "delete", "list"):
+        return _err('action 必须是 save / recall / delete / list')
 
     if action == "save":
-        key = args.get("key", "").strip()
-        value = args.get("value", "").strip()
-        if not key:
-            return "错误：save 操作需要提供 key。"
-        if not value:
-            return "错误：save 操作需要提供 value。"
-        _memory_manager.save_core(key, value)
-        return f"记忆已保存：{key} = {value}"
-
-    elif action == "recall":
-        key = args.get("key", "").strip()
-        if not key:
-            return "错误：recall 操作需要提供 key。"
-        cache_val = _memory_manager._core_cache.get(key)
-        if cache_val is not None:
-            return f"{key} = {cache_val}"
-        items = _memory_manager.search_episodic(key, top_k=5)
-        if items:
-            return "语义检索结果：\n" + "\n".join(f"  {m}" for m in items)
-        return f"未找到记忆：{key}"
-
-    elif action == "list":
-        items = _memory_manager.search_core()
-        if not items:
-            return "暂无任何核心记忆。"
-        return f"共 {len(items)} 条核心记忆：\n" + "\n".join(f"  {m}" for m in items)
-
-    elif action == "delete":
-        key = args.get("key", "").strip()
-        if not key:
-            return "错误：delete 操作需要提供 key。"
-        _memory_manager.delete(key)
-        return f"记忆已删除：{key}"
-
-    elif action == "add_document":
-        from tools.manual_memory import add_document as _add_doc
-
-        content = args.get("content", "").strip()
-        path = args.get("path", "").strip()
-        source = args.get("source", "").strip()
-
-        if not content and path:
-            if not os.path.isabs(path):
-                path = os.path.join(os.getcwd(), path)
-            if not os.path.exists(path):
-                return f"错误：文件不存在：{path}"
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except OSError as e:
-                return f"错误：无法读取文件：{e}"
-            if not source:
-                source = path
-
+        content = (args.get("content") or "").strip()
         if not content:
-            return "错误：add_document 需要提供 content 或 path。"
-        if not source:
-            return "错误：add_document 需要提供 source（文档来源标识）。"
+            return _err("save 需要提供 content")
 
-        try:
-            return _add_doc(content, source)
-        except Exception as e:
-            return f"导入文档失败：{e}"
-
-    elif action == "forget":
-        from tools.manual_memory import forget as _forget
-
-        title_or_source = args.get("title_or_source", "").strip()
-        if not title_or_source:
-            return "错误：forget 操作需要提供 title_or_source。"
-        try:
-            return _forget(title_or_source)
-        except Exception as e:
-            return f"删除记忆失败：{e}"
-
-    elif action == "search":
-        from tools.manual_memory import search_manual as _search_manual
-
-        query = args.get("query", "").strip()
-        scope = args.get("scope", "manual").strip()
-
+    if action == "recall":
+        query = (args.get("query") or "").strip()
         if not query:
-            return "错误：search 操作需要提供 query。"
+            return _err("recall 需要提供 query")
 
-        parts = []
+    if action == "delete":
+        memory_id = (args.get("memory_id") or "").strip()
+        if not memory_id:
+            return _err("delete 需要提供 memory_id")
 
-        # 搜索手动知识库
-        if scope in ("manual", "all"):
-            try:
-                manual_result = _search_manual(query, top_k=5)
-                if "未找到" not in manual_result:
-                    parts.append("【手动知识库】\n" + manual_result)
-            except Exception as e:
-                parts.append(f"【手动知识库】搜索失败：{e}")
+    # ── core 层 ────────────────────────────────────────────
 
-        # 搜索核心记忆
-        if scope in ("core", "all"):
-            core_items = _memory_manager.search_core()
-            if core_items:
-                parts.append("【核心记忆】\n" + "\n".join(f"  {m}" for m in core_items))
-            # 搜索对话情节记忆
-            if _memory_manager.available:
-                episodic_items = _memory_manager.search_episodic(query, top_k=3)
-                if episodic_items:
-                    parts.append("【对话记忆】\n" + "\n".join(f"  {m}" for m in episodic_items))
+    if layer == "core":
+        if action == "save":
+            return _memory_manager.save_core(content)
 
-        return "\n\n".join(parts) if parts else f"未找到与 '{query}' 相关的记忆。"
+        elif action == "recall":
+            return _err("核心记忆全量注入，无需 recall，请使用 list 查看")
 
-    else:
-        return f"错误：未知 action：{action}，可选值为 save/recall/list/delete/add_document/forget/search。"
+        elif action == "delete":
+            return _memory_manager.delete_core(memory_id)
+
+        elif action == "list":
+            items = _memory_manager.list_core()
+            if not items:
+                return "暂无核心记忆"
+            lines = ["共 {} 条核心记忆：".format(len(items))]
+            for it in items:
+                lines.append(f"  [{it['id']}] {it['content']}")
+            return "\n".join(lines)
+
+    # ── episodic 层 ────────────────────────────────────────
+
+    if layer == "episodic":
+        if action == "save":
+            return _memory_manager.save_episodic(content)
+
+        elif action == "recall":
+            items = _memory_manager.recall_episodic(query, top_k=10)
+            if not items:
+                return "未找到相关情景记忆"
+            lines = ["搜索 \"{}\" 返回 {} 条结果：".format(query, len(items))]
+            for it in items:
+                lines.append("  [{id}] ({score:.2f}) {content}".format(**it))
+            return "\n".join(lines)
+
+        elif action == "delete":
+            return _memory_manager.delete_episodic(memory_id)
+
+        elif action == "list":
+            items = _memory_manager.list_episodic(top_k=20)
+            if not items:
+                return "暂无情景记忆"
+            lines = ["共 {} 条近期情景记忆：".format(len(items))]
+            for it in items:
+                lines.append("  [{id}] {content}".format(**it))
+            return "\n".join(lines)
+
+    return _err("未知操作")

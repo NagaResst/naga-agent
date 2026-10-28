@@ -16,12 +16,17 @@ def _load_tiktoken():
         return None
 
 
+def input_budget(context_window: int, tool_tokens: int) -> int:
+    return context_window - min(4096, max(512, context_window // 5)) - tool_tokens
+
+
 class TokenTracker:
     def __init__(self):
         self._tiktoken = None
         self._mode = "unavailable"
         self._estimate_multiplier = 1.0
         self._calibration_samples = 0
+        self._text_token_cache = {}
         self._init_tokenizer()
 
     def _init_tokenizer(self):
@@ -46,10 +51,18 @@ class TokenTracker:
     def count_tokens(self, text: str) -> int:
         if not text:
             return 0
+        cache_key = (text, self._estimate_multiplier) if len(text) <= 4096 else None
+        if cache_key is not None and cache_key in self._text_token_cache:
+            return self._text_token_cache[cache_key]
         if self._mode == "tiktoken":
-            return self._scale_estimate(len(self._tiktoken.encode(text)))
-        # 粗略估算：平均每个字符 0.4 个 token（中英混合场景）
-        return self._scale_estimate(max(1, int(len(text) * 0.4)))
+            estimate = self._scale_estimate(len(self._tiktoken.encode(text)))
+        else:
+            estimate = self._scale_estimate(max(1, int(len(text) * 0.4)))
+        if cache_key is not None:
+            if len(self._text_token_cache) >= 1024:
+                self._text_token_cache.clear()
+            self._text_token_cache[cache_key] = estimate
+        return estimate
 
     def estimate_tools(self, tools: list | None) -> int:
         if not tools:
@@ -85,6 +98,7 @@ class TokenTracker:
             4,
         )
         self._calibration_samples += 1
+        self._text_token_cache.clear()
 
     def record_usage(self, session_manager, session_id: str, model: str, usage) -> dict:
         """从 API 返回的 usage 对象读取真实消耗并持久化记录。
