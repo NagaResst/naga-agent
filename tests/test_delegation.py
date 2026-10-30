@@ -1,12 +1,20 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from rich.console import Console
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_to_text
+
 from agent.core import Agent
+from agent.skill_registry import discover_skills
 from agent.subagent import SubtaskRunner
+from agent.token_tracker import TokenTracker
+from main import OutputPane
 from session.sqlite_session import SessionManager
 
 
@@ -321,8 +329,68 @@ class MainAgentDelegationTests(unittest.TestCase):
         ]
 
         self.assertEqual([skill["name"] for skill in agent._match_skills("python test")], ["testing"])
-        self.assertEqual([skill["name"] for skill in agent._match_skills("@skill(manual) python test")],
-                         ["manual", "testing"])
+        self.assertEqual([skill["name"] for skill in agent._match_skills("/manual python test")], ["testing"])
+        agent._skills[2]["enabled"] = True
+        self.assertEqual([skill["name"] for skill in agent._match_skills("/manual python test")],
+                         ["manual"])
+        self.assertEqual([skill["name"] for skill in agent._match_skills("please /manual python test")],
+                         ["testing"])
+
+    def test_all_frontmatter_and_explicit_entry_file_are_injected_in_full(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = "---\nname: demo\nenabled: true\n---\n" + "full instruction\n" * 180
+            disabled_frontmatter = "---\nname: disabled\ndescription: " + "x" * 1200 + "\nenabled: false\n---\n"
+            (Path(directory) / "demo.md").write_text(source, encoding="utf-8")
+            (Path(directory) / "disabled.md").write_text(disabled_frontmatter + "not active\n", encoding="utf-8")
+
+            agent = Agent.__new__(Agent)
+            agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 10000}, "delegation": {}}
+            agent.model = "main"
+            agent.session_id = "test"
+            agent.max_history = 10
+            agent.session_manager = Mock()
+            agent.session_manager.get_summary_record.return_value = None
+            agent.session_manager.get_history.return_value = [{"role": "user", "content": "/demo do task"}]
+            agent._client = Mock()
+            agent._token_tracker = Mock()
+            agent._token_tracker.count_tokens.side_effect = len
+            agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(message)) for message in messages)
+            agent._token_tracker.estimate_tools.return_value = 0
+            agent._memory_manager = None
+            agent._subtask_runner = None
+            agent._session_theme = ""
+            agent._skills = discover_skills(directory, [])
+            agent._sync_active_skills = Mock()
+            agent._select_tools = Mock(return_value=[])
+
+            messages = agent._get_messages()
+            catalog = next(message["content"] for message in messages if message["content"].startswith("【Skill frontmatter 目录"))
+            explicit = next(message["content"] for message in messages if message["content"].startswith("【用户指定 Skill："))
+            self.assertIn(disabled_frontmatter.strip(), catalog)
+            self.assertIn("---\nname: demo\nenabled: true\n---", catalog)
+            self.assertTrue(explicit.endswith(source))
+            self.assertGreater(len(source), 2048)
+
+            agent.session_manager.get_history.return_value = [{"role": "user", "content": "demo task"}]
+            automatic = agent._get_messages()
+            self.assertFalse(any(message["content"].startswith("【用户指定 Skill：") for message in automatic))
+            self.assertTrue(any("【激活 Skill：demo】" in message["content"] for message in automatic))
+
+    def test_oversized_explicit_skill_fails_without_truncating(self):
+        agent = Agent.__new__(Agent)
+        agent.config = {"agent": {}}
+        agent.max_history = 10
+        agent._token_tracker = Mock()
+        agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(message)) for message in messages)
+        agent._prompt_budget = Mock(return_value=100)
+        messages = [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "【Skill frontmatter 目录：仅供参考】\n---\nname: demo\n---"},
+            {"role": "user", "content": "【用户指定 Skill：demo】\n" + "content" * 100},
+            {"role": "user", "content": "/demo do task"},
+        ]
+        with self.assertRaisesRegex(ValueError, "SKILL.md 全文超出上下文窗口"):
+            agent._fit_messages(messages, 100, [])
 
     def test_runtime_state_refresh_preserves_stable_system_prefix(self):
         agent = Agent.__new__(Agent)
@@ -439,8 +507,8 @@ class MainAgentDelegationTests(unittest.TestCase):
         delegated = agent._select_tools("third")
         self.assertIsNot(delegated, first)
         self.assertEqual(delegated[-1]["function"]["name"], "delegate_tasks")
-        agent.tool_definitions = [{"type": "function", "function": {"name": "fetch_url"}}]
-        self.assertEqual(agent._select_tools("fourth")[0]["function"]["name"], "fetch_url")
+        agent.tool_definitions = [{"type": "function", "function": {"name": "memory"}}]
+        self.assertEqual(agent._select_tools("fourth")[0]["function"]["name"], "memory")
         agent._token_tracker.estimate_multiplier = 1.2
         agent._prompt_budget(4096, delegated)
         agent._prompt_budget(4096, delegated)
@@ -493,6 +561,68 @@ class MainAgentDelegationTests(unittest.TestCase):
         self.assertIsNone(agent._client.chat.completions.create.call_args_list[1].kwargs["tools"])
         self.assertEqual(agent.session_manager.append_message.call_args_list[-1].args[2], "limited summary")
 
+    def test_chat_preserves_markdown_in_session(self):
+        agent = self._loop_agent()
+        answer = "**Important**\n\n```python\nprint(1)\n```"
+        agent._client.chat.completions.create.return_value = self._stream(answer)
+
+        self.assertEqual(agent.chat("question"), answer)
+        self.assertEqual(agent.session_manager.append_message.call_args_list[-1].args[2], answer)
+
+    def test_chat_renders_streamed_reply_without_duplicate_or_losing_logs(self):
+        pane = OutputPane(Mock())
+        console = Console(file=pane, width=80, force_terminal=True, color_system="standard")
+        agent = self._loop_agent()
+        agent.console = console
+        console.print("tool log")
+        answer = "**Important**\n\n- first\n\n```python\nprint(1)\n```\n" + " filler" * 20
+        answer += "\n\n## Phase 1\n\n| Name | Value |\n| --- | --- |\n| A | B |\n"
+
+        def stream():
+            yield self._stream(answer[:125])[0]
+            self.assertIn("Important", pane._text)
+            self.assertNotIn("**Important**", pane._text)
+            queued_message = threading.Thread(target=lambda: console.print("queued user message"))
+            queued_message.start()
+            queued_message.join()
+            yield self._stream(answer[125:])[0]
+            self.assertNotIn("## Phase 1", pane._text)
+            self.assertIn("queued user message", pane._text)
+
+        agent._client.chat.completions.create.return_value = stream()
+        with patch("agent.core.time.monotonic", side_effect=[1.0, 1.0, 1.3, 1.3]):
+            self.assertEqual(agent.chat("question"), answer)
+        displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertIn("tool log", displayed)
+        self.assertIn("queued user message", displayed)
+        self.assertEqual(displayed.count("Important"), 1)
+        self.assertNotIn("**Important**", displayed)
+        self.assertNotIn("```", displayed)
+        self.assertNotIn("## Phase 1", displayed)
+        self.assertNotIn("| --- |", displayed)
+        self.assertIn("print(1)", displayed)
+
+    def test_chat_renders_markdown_fence_with_surrounding_text(self):
+        pane = OutputPane(Mock())
+        agent = self._loop_agent()
+        agent.console = Console(file=pane, width=80, force_terminal=True, color_system="standard")
+        answer = "Here is the plan:\n\n```markdown\n## Phase 1\n\n**Done**\n\n| Name | Value |\n| --- | --- |\n| A | B |\n```\n\nNext step."
+
+        def stream():
+            yield self._stream(answer[:58])[0]
+            self.assertNotIn("## Phase 1", pane._text)
+            yield self._stream(answer[58:])[0]
+
+        agent._client.chat.completions.create.return_value = stream()
+        self.assertEqual(agent.chat("question"), answer)
+        displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertIn("Here is the plan:", displayed)
+        self.assertIn("Next step.", displayed)
+        self.assertIn("Phase 1", displayed)
+        self.assertNotIn("## Phase 1", displayed)
+        self.assertNotIn("**Done**", displayed)
+        self.assertNotIn("| --- |", displayed)
+
     def test_limit_never_persists_empty_reply(self):
         agent = self._loop_agent()
         agent.config["tools"]["tool_max_rounds"] = 1
@@ -510,8 +640,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_failed_delegation_and_tool_errors_are_recognized(self):
         self.assertTrue(Agent._tool_result_failed("delegate_tasks", '{"results":[{"status":"error"}]}'))
-        self.assertTrue(Agent._tool_result_failed("fetch_url", "[fetch_url 错误] timeout"))
-        self.assertTrue(Agent._tool_result_failed("web_search", "[web_search 错误] unavailable"))
+        self.assertTrue(Agent._tool_result_failed("mcp", "错误：MCP server 请求失败"))
         self.assertTrue(Agent._tool_result_failed("memory", "[memory 参数错误] invalid"))
         self.assertTrue(Agent._tool_result_failed("execute_command", "[命令执行结果]\n状态：失败（返回码 1）"))
         self.assertTrue(Agent._tool_result_failed("execute_command", "[命令执行结果]\n状态：超时（>30 秒）已终止"))
@@ -672,6 +801,30 @@ class MainAgentDelegationTests(unittest.TestCase):
         self.assertEqual(batch[0]["tool_calls"][0]["id"], batch[1]["tool_call_id"])
         self.assertIn("child answer", batch[1]["content"])
         self.assertEqual(agent.session_manager.append_message.call_args_list[-1].args[2], "final answer")
+
+    def test_request_metrics_include_tool_schema_and_actual_prompt_usage(self):
+        agent = self._loop_agent()
+        agent._context_metrics = {"window": 4096}
+        agent._token_tracker.estimate.return_value = 120
+        agent._token_tracker.estimate_tools.return_value = 30
+        agent._client.chat.completions.create.return_value = [
+            SimpleNamespace(usage=SimpleNamespace(prompt_tokens=210, completion_tokens=4), choices=[]),
+            *self._stream("answer"),
+        ]
+
+        self.assertEqual(agent.chat("question"), "answer")
+        self.assertEqual(agent._context_metrics["message_tokens"], 120)
+        self.assertEqual(agent._context_metrics["tool_tokens"], 30)
+        self.assertEqual(agent._context_metrics["prompt_estimate"], 150)
+        self.assertEqual(agent._context_metrics["actual_prompt_tokens"], 210)
+        agent._token_tracker.calibrate_prompt_estimate.assert_called_once_with(150, 210)
+
+    def test_calibration_converges_on_provider_usage(self):
+        with patch("agent.token_tracker._load_tiktoken", return_value=None):
+            tracker = TokenTracker()
+        for _ in range(30):
+            tracker.calibrate_prompt_estimate(round(100 * tracker.estimate_multiplier), 300)
+        self.assertAlmostEqual(tracker.estimate_multiplier, 3, delta=0.1)
 
     def test_reasoning_is_neither_sent_back_nor_persisted(self):
         agent = self._loop_agent()

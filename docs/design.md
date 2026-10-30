@@ -40,7 +40,7 @@ flowchart LR
 | `agent/core.py` | 构造每轮请求与状态；主模型流式调用、工具执行、按需分派、会话与用量写入。 | 工具通过 registry 获取，子任务委托 `SubtaskRunner`，持久化委托 `SessionManager`，记忆委托 `MemoryManager`。 |
 | `agent/subagent.py` | 顺序处理主模型指定的小任务；为每个任务构造独立消息、调用低成本模型，最多使用只读工具若干轮。 | 不读取主会话、不执行写入/命令、不再分派；结果返回主模型，usage 单独写入。 |
 
-`Agent` 在首位 system prompt 中仅加入固定配置和代码规则及 `<theme>...</theme>` 标签协议。Skill frontmatter 形成参考目录，按分数匹配或显式指定的 Skill 正文受 token 限额约束。核心/情景记忆、主题、动态运行状态和历史摘要以带标签的低信任参考消息提供，不提升工具结果为 system 指令。工具 schema 独立于消息优先计入预算。每轮首先由主模型处理，仅在它主动调用 `delegate_tasks` 时使用低成本模型；子任务结果由主模型审阅并完成最终答复。
+`Agent` 在首位 system prompt 中仅加入固定配置和代码规则及 `<theme>...</theme>` 标签协议。所有 Skill 的原始 frontmatter 始终作为参考目录注入；自动匹配的 Skill 正文受 token 限额约束，显式指定则注入入口文件全文，放不下时明确报错。核心/情景记忆、主题、动态运行状态和历史摘要以带标签的低信任参考消息提供，不提升工具结果为 system 指令。工具 schema 独立于消息优先计入预算。每轮首先由主模型处理，仅在它主动调用 `delegate_tasks` 时使用低成本模型；子任务结果由主模型审阅并完成最终答复。
 
 持久化包括用户/助手消息、完整工具调用批次及结果、token 记录、按来源 ID 界定的摘要。工具调用批次在完成后原子写入；修改消息历史、工具调用或提示词结构时，应同时检查上下文预算和会话恢复的影响。
 
@@ -49,13 +49,13 @@ flowchart LR
 | 模块 | 功能设计 | 输入、输出与注意点 |
 | --- | --- | --- |
 | `agent/config.py` | 合并 `.env`、环境变量、`config.toml` 与代码默认值，形成传给 CLI 和 Agent 的嵌套字典。 | `NAGA_DB_PATH` 可覆盖数据库路径；`OPENAI_API_KEY` 回退到 `DASHSCOPE_API_KEY`；`OPENAI_BASE_URL` 优先于 TOML 中的 `model.base_url`；`AGENT_SYSTEM_PROMPT` 优先于提示词文件及内联内容。 |
-| `config.toml` | 模型列表/专属参数、分派预算、工具限额、Agent UI 与提示词、搜索、技能、记忆及可选嵌入 daemon 的部署配置。 | 当前主模型为 GLM-5.3，未确认可用子模型，默认关闭分派。Qdrant 为外部服务 (`localhost:6333`)；远程 Qwen3 Embedding 和 Reranker 不需本地 daemon。模型自带联网搜索被禁用，联网请使用 `web_search` 工具。 |
-| `agent/subagent.py` | 提供 `delegate_tasks` schema，按任务各自调用低成本模型，可请求已注册的 `read_file`、`fetch_url`、`web_search`。 | 默认每次最多 3 个任务、每任务 3 轮只读工具、主对话最多分派 2 次；参数从 `[delegation]` 配置且受到上限约束。 |
+| `config.toml` | 模型列表/专属参数、分派预算、工具限额、Agent UI 与提示词、MCP server、技能、记忆及可选嵌入 daemon 的部署配置。 | Qdrant 为外部服务 (`localhost:6333`)；远程 Qwen3 Embedding 和 Reranker 不需本地 daemon。模型自带联网搜索被禁用，联网由配置的 MCP server 提供。 |
+| `agent/subagent.py` | 提供 `delegate_tasks` schema，按任务各自调用低成本模型，仅可请求已注册的 `read_file`。 | 默认每次最多 3 个任务、每任务 3 轮只读工具、主对话最多分派 2 次；参数从 `[delegation]` 配置且受到上限约束。 |
 | `agent/context_window.py` | 解析模型元数据中的上下文大小；以服务地址和模型名作为缓存键写入 `.context_window_cache.json`。 | 优先级：正数人工覆盖、已确认的缓存、模型元数据、默认回退值 131072（128k）；若模型窗口小于回退值须手动配置。失败探测仅缓存 60 秒，不从模型名或报错推断。 |
 | `agent/token_tracker.py` | 估算消息/工具 schema token、利用 API usage 渐进校准估算系数，并将真实消耗按模型写入会话存储。 | 优先尝试 tiktoken 编码；不可用时字符粗估。`get_session_summary()` 统计本会话输入/输出及调用次数，不是计费金额。 |
 | `agent/skill_registry.py` | 扫描 `skills/*.md` 或 `skills/*/SKILL.md`，解析简化 frontmatter，提取关键词/示例并收集目录资源清单。 | 非通用 YAML 解析器；`skills.enabled` 非空时覆盖文件中的 `enabled`，否则按文件字段决定。目录不存在时返回空列表。 |
 
-`Agent` 会构造用户约束、当前步骤、已读 Skill 文件和工具派生信息等参考状态块，按配置限制条目数与字符数；后续请求可恢复部分上轮状态。技能可以通过 CLI 开关、`skill_manager` 工具加载，或在输入中使用 `@skill(name)` 强制选取。`_match_skills()` 按 frontmatter 关键词与示例打分，并应用 `match_top_k` / `min_match_score`，显式指定的 Skill 不受阈值限制。
+`Agent` 会构造用户约束、当前步骤、已读 Skill 文件和工具派生信息等参考状态块，按配置限制条目数与字符数；后续请求可恢复部分上轮状态。技能文件放入 `skills/` 后可通过 CLI 或 `skill_manager` 工具启停；以 `/{skillname}` 开头只选取指定的已启用 Skill，普通请求仍自动匹配。`_match_skills()` 按 frontmatter 关键词与示例打分，并应用 `match_top_k` / `min_match_score`；停用的 Skill 不可被选取。
 
 `Agent` 在组装请求时按探测到的窗口预留生成空间和工具 schema 大小。固定 system 和最新用户轮次优先；记忆只占剩余空间的最多 10% 且不超过 2048 token，过长条目跳过。默认仅最近 3 批工具调用及其结果进入上下文，较早批次在预算判断与压缩之前成对剔除，不写入摘要；用户请求与助手结论仍保留。流式思维链从不持久化或回送给模型。输入超过可用预算的 75% 时，按完整旧轮次生成带来源消息 ID 的有界摘要，保存至 SQLite；原文不删除，恢复时从最后覆盖 ID 继续增量读取。其余按 token 估算和 `max_history` 保留近期轮次；过长工具输出只截断发送副本。主子模型共享预算算法，正向模型窗口缓存一天后重新核验；`/token` 展示最近窗口、schema、输入估算和摘要进度。
 
@@ -79,12 +79,9 @@ SQLite 的表为 `sessions`、`messages`、`token_usage`、`summaries`、`memori
 | --- | --- | --- |
 | `tools/execute_command.py` / `execute_command` | 接收 `command`、`description`，用子进程 shell 执行；命中黑名单直接拒绝，高风险关键字即使自动确认开启仍要求确认。 | 默认超时按配置；合并 stdout/stderr 并截断返回；规则为正则匹配而非完整安全隔离，不应执行不可信命令。 |
 | `tools/read_file.py` / `read_file` | 接收路径与可选的 1-based 起止行，返回类型、行范围和 UTF-8 文本。 | 输出正文最多 3000 字符，支持继续分段读；相对路径按当前工作目录解析。 |
-| `tools/edit_file.py` / `edit_file` | 接收路径、唯一的 `old_string`、`new_string`，精确替换一次。 | 不存在或匹配次数非 1 时拒绝；直接写回文件，无自动备份。 |
-| `tools/generate_script.py` / `generate_script` | 用文件名、内容、语言向当前工作目录下 `generated_scripts/` 写文件；shell 脚本赋执行权限。 | 同名直接覆盖；未限制 `filename` 中的路径分隔符，不能视为目录边界安全保证。 |
-| `tools/fetch_url.py` / `fetch_url` | 对 HTTP(S) URL 发 GET；HTML 用 BeautifulSoup 选正文、去导航等噪音；非 HTML 直接截断返回。 | `max_chars` 限制在 500~8000；动态 JS 页面可能没有正文；可跟随重定向，未限制内网目标。 |
-| `tools/web_search.py` / `web_search` | 接收查询词、数量、时效；优先请求 Bocha，缺 Key、超时、限流等条件下回退 DDG，并标注来源可信度。 | 部分 Bocha 错误直接返回错误；搜索结果摘要不是事实验证，需要 `fetch_url` 阅读原文。 |
+| `tools/mcp.py` / `mcp` | 按 `list` 查看已配置的 server/tool 目录，指定 `tool` 查看参数 schema，按 `call` 转发工具参数；支持 stdio 与 Streamable HTTP。 | 仅配置并启用 server 时暴露；HTTP header 支持 `${ENV_VAR}`；缺少变量时拒绝请求。由 MCP 服务端决定具体工具权限。 |
 | `tools/memory.py` / `memory` | 操作两层记忆，支持保存、查询/列表与按 ID 删除。 | 核心层容量有限；情景层取决于 mem0、Qdrant 和嵌入服务可用性。 |
-| `tools/skill_manager.py` / `skill_manager` | `load` 链接外部单文件/目录 Skill 并激活，`remove` 删除链接或本地目标，`reload` 重扫描。 | `load` 同名目标会先被删除；`remove` 对非链接实体会删除文件或目录，使用前确认目标来源。 |
+| `tools/skill_manager.py` / `skill_manager` | `list` 列出、`enable/disable` 启停、`reload` 重扫描已有 Skill。 | 不创建、替换或删除 Skill 文件；进程内启停状态在重新扫描后仍保留。 |
 | `agent/subagent.py` / `delegate_tasks` | 接收任务数组，每项包含任务描述及可选背景；子 Agent 顺序执行、返回分项结果及状态。 | 无共享历史、无嵌套分派；只读白名单，不允许命令执行和文件修改。未配置子模型时不暴露。 |
 
 ### 工具调用时序
@@ -120,7 +117,7 @@ sequenceDiagram
 | `/token`、`/history`、`/clear` | 查看用量、查看最近消息摘要、确认后删除会话消息。 |
 | `/skill list/on/off` | 查看并切换内存中的技能启用状态；技能文件由扫描器发现。 |
 
-`main.py` 在新会话首次对话后用后台线程向模型请求短标题并更新会话名。底部状态栏读取持久化历史、估算 token，并查询当前模型窗口；状态栏显示的是估算值，不等同于真实账单。`memory/main.py` 当前与 `main.py` 内容完全相同，是重复的 CLI 入口文件；项目常规入口仍为仓库根目录的 `main.py`。
+`main.py` 在新会话首次对话后用后台线程向模型请求短标题并更新会话名。底部状态栏显示最近一次发送请求的消息及工具 schema 总估算，不读取持久化历史作为上下文用量；`/token` 另外显示 API 返回的最近真实输入。已被裁剪的旧历史和预留输出空间不计入已用输入。`memory/main.py` 是重复的 CLI 入口文件；项目常规入口仍为仓库根目录的 `main.py`。
 
 ### Agent 单轮内部设计
 

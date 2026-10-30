@@ -2,6 +2,9 @@ import os
 import re
 
 
+_FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
 _SKILL_TERM_STOPWORDS = {
     "assistant", "skill", "skills", "agent", "mode", "tool", "tools",
     "帮助", "助手", "模式", "工具", "能力", "技能", "自动", "执行", "生成",
@@ -17,8 +20,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     若无 frontmatter，返回 ({}, 全文)。
     仅解析简单 key: value 格式，不引入外部依赖。
     """
-    pattern = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-    match = pattern.match(text)
+    match = _FRONTMATTER_PATTERN.match(text)
     if not match:
         return {}, text.strip()
 
@@ -130,7 +132,7 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
       - 若空列表：尊重每个文件 frontmatter 中的 enabled 字段（默认 False）
 
         返回 list[dict]，每项：
-            { name, description, enabled, prompt, source_file, keywords, examples, match_phrases, match_terms }
+            { name, description, enabled, frontmatter, source_text, prompt, source_file, ... }
     """
     if not os.path.isdir(skills_dir):
         return []
@@ -166,6 +168,8 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
             continue
 
         meta, body = _parse_frontmatter(content)
+        frontmatter_match = _FRONTMATTER_PATTERN.match(content)
+        frontmatter = frontmatter_match.group(0).rstrip() if frontmatter_match else ""
 
         # name 优先用 frontmatter，回退到文件名/目录名
         name = meta.get("name", default_name)
@@ -196,6 +200,8 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
             "name": name,
             "description": description,
             "enabled": enabled,
+            "frontmatter": frontmatter,
+            "source_text": content,
             "prompt": body,
             "source_file": filepath,
             "skill_dir": skill_dir,

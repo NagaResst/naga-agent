@@ -32,7 +32,7 @@ DELEGATE_TASKS_DEFINITION = {
 
 
 class SubtaskRunner:
-    READ_ONLY_TOOLS = frozenset({"read_file", "fetch_url", "web_search"})
+    READ_ONLY_TOOLS = frozenset({"read_file"})
 
     def __init__(self, client, model: str, tool_definitions: list, tool_executors: dict,
                  record_usage, max_tasks: int = 3, max_rounds: int = 3,

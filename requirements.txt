@@ -5,8 +5,7 @@ rich>=13.0.0
 prompt_toolkit>=3.0.0
 tiktoken>=0.7.0
 requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=5.0.0
+mcp>=1.0,<2.0
 # 分层记忆系统
 mem0ai[nlp]>=0.1.0
 qdrant-client>=1.9.0   # 统一向量后端（Qdrant server 模式）
@@ -14,5 +13,4 @@ qdrant-client>=1.9.0   # 统一向量后端（Qdrant server 模式）
 fastapi>=0.110.0
 uvicorn>=0.29.0
 sentence-transformers>=3.0.0
-ddgs>=0.1.0                # web_search fallback，Bocha 不可用时自动切换
 fastembed>=0.3.0           # BM25 关键词检索（mem0 向量库增强）

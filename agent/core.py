@@ -9,11 +9,14 @@ from typing import Optional
 
 import os
 from openai import OpenAI
+from markdown_it import MarkdownIt
+from rich.console import Console
+from rich.markdown import Markdown
 
 from tools.registry import discover_tools
 from tools import execute_command as execute_command_module
 import tools.memory as memory_module
-import tools.web_search as web_search_module
+import tools.mcp as mcp_module
 from agent.token_tracker import TokenTracker, input_budget
 from agent.subagent import DELEGATE_TASKS_DEFINITION, SubtaskRunner
 from agent.skill_registry import discover_skills, _extract_match_terms, _normalize_skill_text
@@ -22,6 +25,17 @@ from agent.context_window import (
     get_context_window,
 )
 from memory.manager import MemoryManager
+
+
+def markdown_body(content: str) -> str:
+    tokens = MarkdownIt().parse(content)
+    fences = [token for token in tokens if token.type == "fence"]
+    if (len(fences) == 1 and fences[0].info.strip().casefold() in ("markdown", "md")
+            and all(token.type in ("fence", "paragraph_open", "inline", "paragraph_close") for token in tokens)):
+        start, end = fences[0].map
+        lines = content.splitlines(keepends=True)
+        return "".join(lines[:start]) + "\n" + fences[0].content + "\n" + "".join(lines[end:])
+    return content
 
 
 class Agent:
@@ -128,8 +142,7 @@ class Agent:
         else:
             console.print("[dim]记忆系统已就绪（核心记忆 SQLite，情景记忆不可用）[/dim]")
 
-        # 注入 search 配置到 web_search 工具
-        web_search_module.set_config(config.get("search", {}))
+        mcp_module.set_config(config.get("mcp", {}))
 
         # Token 追踪器
         self._token_tracker = TokenTracker()
@@ -165,6 +178,7 @@ class Agent:
         _project_root = os.path.dirname(os.path.dirname(__file__))
         self._skills_dir = os.path.join(_project_root, "skills")
         self._skills_enabled_names = config.get("skills", {}).get("enabled", [])
+        self._skill_overrides = {}
         self._skills: list = discover_skills(self._skills_dir, self._skills_enabled_names)
         if self._skills:
             active = [s["name"] for s in self._skills if s["enabled"]]
@@ -218,6 +232,9 @@ class Agent:
     def reload_skills(self):
         """重新扫描 skills/ 目录，热更新已加载的 skill 列表。"""
         self._skills = discover_skills(self._skills_dir, self._skills_enabled_names)
+        for skill in self._skills:
+            if skill["name"] in self._skill_overrides:
+                skill["enabled"] = self._skill_overrides[skill["name"]]
 
     @staticmethod
     def _dedupe_trimmed_lines(items: list[str], limit: int) -> list[str]:
@@ -454,10 +471,8 @@ class Agent:
             desc = tool_args.get("description", "").strip()
             cmd = tool_args.get("command", "").strip()
             return (f"执行命令：{desc or cmd}"[:180]).strip()
-        if tool_name == "fetch_url":
-            return f"抓取网页：{tool_args.get('url', '')}"[:180]
-        if tool_name == "web_search":
-            return f"联网搜索：{tool_args.get('query', '')}"[:180]
+        if tool_name == "mcp":
+            return f"MCP {tool_args.get('action', '')}：{tool_args.get('server', '')}/{tool_args.get('tool', '')}"[:180]
         return f"调用工具：{tool_name}"[:180]
 
     def _summarize_tool_result(self, tool_name: str, tool_result: str) -> str:
@@ -611,11 +626,14 @@ class Agent:
         messages.insert(latest_user_index, {"role": "user", "content": state_block})
 
     def _build_skill_prompt_block(self, skill: dict) -> str:
-        directive = (
-            "用户已显式指定该 Skill，必须优先遵守其主指令。"
-            if skill.get("_forced")
-            else "当前请求已命中该 Skill，执行时优先遵守其主指令。"
-        )
+        if skill.get("_forced"):
+            return (
+                f"【用户指定 Skill：{skill['name']}】\n"
+                f"用户明确指定使用此 Skill；以下是入口文件 {skill['source_file']} 的全文：\n"
+                f"{skill.get('source_text', skill.get('prompt', ''))}"
+            )
+
+        directive = "当前请求已命中该 Skill，执行时优先遵守其主指令。"
 
         resource_files = skill.get("resource_files", [])
         resource_lines = []
@@ -655,17 +673,15 @@ class Agent:
         return "\n".join(block_parts)
 
     def _extract_forced_skill_names(self, user_text: str) -> set[str]:
-        import re
-
         forced_names = set()
         if not user_text:
             return forced_names
 
-        raw_signal = user_text.lower()
-        for match in re.findall(r'@skill\(([^)]+)\)', raw_signal):
-            candidate = _normalize_skill_text(match)
+        match = re.match(r"^/([^\s/]+)(?:\s|$)", user_text)
+        if match:
+            candidate = _normalize_skill_text(match.group(1))
             for skill in self._skills:
-                if _normalize_skill_text(skill.get("name", "")) == candidate:
+                if skill["enabled"] and _normalize_skill_text(skill["name"]) == candidate:
                     forced_names.add(skill["name"])
         return forced_names
 
@@ -703,7 +719,7 @@ class Agent:
         return score, reasons
 
     def _select_tools(self, last_user_msg: str) -> list:
-        """返回完整工具 schema 列表。所有工具始终可见。"""
+        """返回内置工具及已配置的 MCP 入口。"""
         delegation_enabled = bool(self._subtask_runner and self.config.get("delegation", {}).get("enabled"))
         cached = getattr(self, "_tool_schema_cache", None)
         if cached is not None and cached[0] is self.tool_definitions and cached[1] == delegation_enabled:
@@ -711,6 +727,7 @@ class Agent:
         tools = [
             {k: v for k, v in td.items() if k != "tags"}
             for td in self.tool_definitions
+            if td["function"]["name"] != "mcp" or mcp_module.configured()
         ]
         if delegation_enabled:
             tools.append(DELEGATE_TASKS_DEFINITION)
@@ -721,21 +738,19 @@ class Agent:
         """优先选显式指定的 Skill，其余按 frontmatter 匹配度选取。"""
         signal = _normalize_skill_text(self._session_theme + " " + last_user_msg[:400])
         forced_names = self._extract_forced_skill_names(last_user_msg)
-        forced = []
+        if forced_names:
+            return [{**skill, "_forced": True} for skill in self._skills if skill["name"] in forced_names]
         candidates = []
         threshold = self.config.get("skills", {}).get("min_match_score", 2.2)
         limit = self.config.get("skills", {}).get("match_top_k", 2)
         for skill in self._skills:
-            if not skill["enabled"] and skill["name"] not in forced_names:
+            if not skill["enabled"]:
                 continue
             score, _ = self._score_skill_match(skill, signal)
-            is_forced = skill["name"] in forced_names
-            if is_forced:
-                forced.append({**skill, "_forced": True})
-            elif score >= threshold:
+            if score >= threshold:
                 candidates.append((score, skill))
         candidates.sort(key=lambda item: (-item[0], item[1]["name"]))
-        return forced + [{**skill, "_forced": False} for _, skill in candidates[:limit]]
+        return [{**skill, "_forced": False} for _, skill in candidates[:limit]]
 
     def _load_session_history(self, summary: dict) -> tuple[list[dict], dict]:
         covered_id = summary["last_message_id"]
@@ -843,33 +858,31 @@ class Agent:
             "再输出正文。不要解释标签。示例：`<theme>K8s集群运维</theme>`"
         )
         base_prompt += _theme_instr
-        # Skill 目录来自 frontmatter；正文只为当前选中的 Skill 按预算提供。
+        # Skill 目录保留原始 frontmatter；正文仅按当前选中的 Skill 提供。
         active_skills = self._match_skills(last_user_msg)
         self._sync_active_skills(active_skills)
 
-        skill_schema_lines = ["【可用 Skill 目录：参考信息，按需读取入口文件】"]
-        catalog_budget = min(1024, max(0, self._prompt_budget(context_window, active_tools) // 8))
+        skill_schema_lines = ["【Skill frontmatter 目录：仅供参考】"]
         for s in self._skills:
-            if not s.get("enabled") and not any(active["name"] == s["name"] for active in active_skills):
-                continue
-            desc = s.get("description", "") or s["name"]
-            keywords = s.get("keywords", [])
-            kw = f"（关键词：{', '.join(keywords)}）" if keywords else ""
-            line = f"- {s['name']}：{desc}{kw}；入口：{s.get('source_file', '')}"
-            if self._token_tracker.count_tokens("\n".join(skill_schema_lines + [line])) > catalog_budget:
-                break
-            skill_schema_lines.append(line)
+            skill_schema_lines.append(
+                f"【{s['name']}；{'启用' if s['enabled'] else '停用'}；入口：{s['source_file']}】\n"
+                f"{s.get('frontmatter') or '（无 frontmatter）'}"
+            )
 
         main_system = base_prompt
         budget = self._prompt_budget(context_window, active_tools)
         references = []
+        skill_references = []
         if len(skill_schema_lines) > 1:
-            references.append("\n".join(skill_schema_lines))
+            skill_references.append("\n\n".join(skill_schema_lines))
         if self._session_theme:
             references.append(f"【当前会话主题：参考信息】\n{self._session_theme}")
         skill_budget = min(2048, max(0, budget // 5))
         for skill in active_skills:
             block = self._build_skill_prompt_block(skill)
+            if skill.get("_forced"):
+                skill_references.append(block)
+                continue
             if self._token_tracker.count_tokens(block) > skill_budget:
                 suffix = "\n[Skill 内容受预算限制，请按需读取入口文件]"
                 allowed = max(0, skill_budget - self._token_tracker.count_tokens(suffix))
@@ -887,11 +900,13 @@ class Agent:
         self._last_skill_system_tokens = 0
         if references:
             raw_messages.insert(0, {"role": "user", "content": "\n\n".join(references)})
+        for reference in reversed(skill_references):
+            raw_messages.insert(0, {"role": "user", "content": reference})
 
         latest_user_index = next((index for index in range(len(raw_messages) - 1, -1, -1)
                                   if raw_messages[index].get("role") == "user"), len(raw_messages))
         mandatory = [{"role": "system", "content": main_system}] + raw_messages[latest_user_index:]
-        mandatory.extend({"role": "user", "content": item} for item in references)
+        mandatory.extend({"role": "user", "content": item} for item in skill_references + references)
         if summary["last_message_id"] and summary["text"]:
             mandatory.append({"role": "user", "content": summary["text"]})
         if hasattr(self, "_pinned_constraints") and hasattr(self, "_runtime_task_state"):
@@ -955,7 +970,10 @@ class Agent:
             "window": context_window,
             "input_budget": budget,
             "tool_tokens": self._token_tracker.estimate_tools(active_tools),
-            "prompt_estimate": self._token_tracker.estimate(fitted),
+            "message_tokens": self._token_tracker.estimate(fitted),
+            "prompt_estimate": self._token_tracker.estimate(fitted)
+            + self._token_tracker.estimate_tools(active_tools),
+            "model": self.model,
             "summary_through_id": summary["last_message_id"],
             "tokenizer_mode": getattr(self._token_tracker, "mode", "unknown"),
         }
@@ -1002,10 +1020,12 @@ class Agent:
         system = [message for message in messages if message.get("role") == "system"]
         summary = [message for message in messages if message.get("role") == "user" and
                    (message.get("content") or "").startswith("【历史摘要：参考数据")]
-        prefix = system + summary
+        skill_references = [message for message in messages if message.get("role") == "user" and
+                            (message.get("content") or "").startswith(("【Skill frontmatter 目录", "【用户指定 Skill："))]
+        prefix = system + summary + skill_references
         turns = []
         for message in messages:
-            if message.get("role") == "system" or message in summary:
+            if message.get("role") == "system" or message in summary or message in skill_references:
                 continue
             if message.get("role") == "user" or not turns:
                 turns.append([])
@@ -1039,12 +1059,14 @@ class Agent:
                 if self._token_tracker.estimate(fitted) <= budget:
                     break
         if self._token_tracker.estimate(fitted) > budget:
+            if skill_references:
+                raise ValueError("Skill frontmatter 或指定的 SKILL.md 全文超出上下文窗口，请增加窗口或减少 Skill 内容")
             raise ValueError("当前问题或工具结果超出上下文窗口，请缩短输入或提高 context_token_limit")
         return fitted
 
     @staticmethod
     def _tool_result_failed(name: str, result: str) -> bool:
-        if result.startswith("错误：") or result.startswith(("[fetch_url 错误]", "[web_search 错误]", "[memory 参数错误]")):
+        if result.startswith("错误：") or result.startswith("[memory 参数错误]"):
             return True
         if name == "execute_command":
             if result.startswith(("拒绝执行：", "命令已取消")):
@@ -1066,6 +1088,8 @@ class Agent:
                 return "错误：本轮子任务分派次数已达上限，请使用现有结果完成答复"
             self._delegation_calls += 1
             return self._subtask_runner.execute(args)
+        if name == "mcp" and not mcp_module.configured():
+            return "错误：未配置 MCP server"
         executor = self.tool_executors.get(name)
         if executor is None:
             return f"错误：未找到工具 '{name}'"
@@ -1093,13 +1117,10 @@ class Agent:
             if cmd.startswith("pip") or cmd.startswith("brew") or cmd.startswith("apt"):
                 return "⏳ 正在安装依赖…"
             return "⏳ 正在处理，请稍候…"
-        if tool_name == "generate_script":
-            filename = tool_args.get("filename", "文件")
-            return f"⏳ 正在生成 {filename}…"
+        if tool_name == "mcp":
+            return "⏳ 正在调用 MCP 工具…"
         if tool_name == "read_file":
             return f"⏳ 正在读取文件…"
-        if tool_name == "edit_file":
-            return f"⏳ 正在编辑文件…"
         if tool_name == "memory":
             return f"⏳ 正在操作记忆…"
         return "⏳ 正在处理，请稍候…"
@@ -1191,8 +1212,12 @@ class Agent:
                     return str(exc)
                 context_metrics = getattr(self, "_context_metrics", None)
                 if context_metrics is not None:
-                    context_metrics["prompt_estimate"] = self._token_tracker.estimate(messages)
+                    context_metrics["message_tokens"] = self._token_tracker.estimate(messages)
                     context_metrics["tool_tokens"] = self._token_tracker.estimate_tools(_active_tools)
+                    context_metrics["prompt_estimate"] = (
+                        context_metrics["message_tokens"] + context_metrics["tool_tokens"]
+                    )
+                    context_metrics["model"] = active_model
                     context_metrics["input_budget"] = self._prompt_budget(context_window, _active_tools)
                 kwargs = dict(
                     model=active_model,
@@ -1233,12 +1258,39 @@ class Agent:
                     else:
                         raise
 
-                request_prompt_estimate = (
-                    self._token_tracker.estimate(kwargs["messages"])
-                    + self._token_tracker.estimate_tools(kwargs.get("tools"))
-                )
+                message_tokens = self._token_tracker.estimate(kwargs["messages"])
+                tool_tokens = self._token_tracker.estimate_tools(kwargs.get("tools"))
+                request_prompt_estimate = message_tokens + tool_tokens
+                if context_metrics is not None:
+                    context_metrics["message_tokens"] = message_tokens
+                    context_metrics["tool_tokens"] = tool_tokens
+                    context_metrics["prompt_estimate"] = request_prompt_estimate
+                    context_metrics["actual_prompt_tokens"] = None
 
                 full_content = ""
+                response_pane = self.console.file if isinstance(self.console, Console) and hasattr(self.console.file, "start_response") else None
+                response_started = False
+                last_render_at = 0.0
+
+                def render_response(final=False):
+                    with self.console.capture() as capture:
+                        self.console.print(Markdown(markdown_body(full_content)))
+                    if final:
+                        response_pane.finish_response(capture.get())
+                    else:
+                        response_pane.update_response(capture.get())
+
+                def print_response(text):
+                    nonlocal response_started, full_content, last_render_at
+                    if response_pane is not None and not response_started:
+                        response_pane.start_response()
+                        response_started = True
+                    self.console.print(text, end="", markup=False, highlight=False)
+                    full_content += text
+                    if response_started and time.monotonic() - last_render_at >= 0.1:
+                        render_response()
+                        last_render_at = time.monotonic()
+
                 # <theme> 标签内联提取状态（每轮重置）
                 _tbuf = ""          # 流开头的静默缓冲区
                 _theme_done = False  # True = 标签阶段结束，进入正常输出
@@ -1292,16 +1344,13 @@ class Agent:
                                     remainder = _tbuf
                                 _theme_done = True
                                 if remainder:
-                                    self.console.print(remainder, end="", markup=False, highlight=False)
-                                    full_content += remainder
+                                    print_response(remainder)
                             elif len(_tbuf) > 120:
                                 # 超过 120 字符仍无标签，当正文处理
                                 _theme_done = True
-                                self.console.print(_tbuf, end="", markup=False, highlight=False)
-                                full_content += _tbuf
+                                print_response(_tbuf)
                         else:
-                            self.console.print(delta.content, end="", markup=False, highlight=False)
-                            full_content += delta.content
+                            print_response(delta.content)
 
                     if delta.tool_calls:
                         for tc_delta in delta.tool_calls:
@@ -1320,10 +1369,11 @@ class Agent:
 
                 # 流结束时若缓冲区未处理（极短回复无法闭合标签），作正文输出
                 if not _theme_done and _tbuf:
-                    self.console.print(_tbuf, end="", markup=False, highlight=False)
-                    full_content += _tbuf
+                    print_response(_tbuf)
 
                 if call_input_tokens and request_prompt_estimate:
+                    if context_metrics is not None:
+                        context_metrics["actual_prompt_tokens"] = call_input_tokens
                     self._token_tracker.calibrate_prompt_estimate(
                         request_prompt_estimate,
                         call_input_tokens,
@@ -1331,6 +1381,8 @@ class Agent:
 
                 if full_content or in_reasoning:
                     self.console.print()
+                if response_started:
+                    render_response(final=True)
 
                 if finish_reason != "tool_calls":
                     if full_content.strip():
@@ -1373,15 +1425,10 @@ class Agent:
                                 self.console.print(f"[dim]$ {cmd}[/dim]")
                             if desc:
                                 self.console.print(f"[dim]意图：{desc}[/dim]")
-                        elif tool_name == "generate_script":
-                            filename = tool_args.get("filename", "")
-                            language = tool_args.get("language", "")
-                            if filename:
-                                self.console.print(f"[dim]生成文件：{filename}  语言：{language}[/dim]")
+                        elif tool_name == "mcp":
+                            self.console.print(f"[dim]MCP：{tool_args.get('server', '')}/{tool_args.get('tool', '')}[/dim]")
                         elif tool_name == "read_file":
                             self.console.print(f"[dim]读取：{tool_args.get('path', '')}[/dim]")
-                        elif tool_name == "edit_file":
-                            self.console.print(f"[dim]编辑：{tool_args.get('path', '')}[/dim]")
                     else:
                         hint = self._humanize_tool_hint(tool_name, tool_args)
                         self.console.print(f"[dim italic]{hint}[/dim italic]")
@@ -1415,7 +1462,7 @@ class Agent:
                 self._set_current_step(pending_step)
 
         # 记录 session + token + 记忆
-        self.session_manager.append_message(self.session_id, "assistant", self._strip_markdown(last_content))
+        self.session_manager.append_message(self.session_id, "assistant", last_content)
         if _acc_input or _acc_output:
             self._token_tracker.record_usage(
                 self.session_manager, self.session_id, active_model,
@@ -1450,13 +1497,7 @@ class Agent:
         for skill in self._skills:
             if skill["name"] == name:
                 skill["enabled"] = enabled
-                # 同步 _skills_enabled_names，确保 reload_skills() 后状态不丢失
-                if enabled:
-                    if name not in self._skills_enabled_names:
-                        self._skills_enabled_names.append(name)
-                else:
-                    if name in self._skills_enabled_names:
-                        self._skills_enabled_names.remove(name)
+                self._skill_overrides[name] = enabled
                 # skill 激活状态变化，清零 skill token 缓存，下一轮重新计算
                 self._last_skill_system_tokens = 0
                 return True

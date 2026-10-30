@@ -66,11 +66,6 @@ def load_config() -> dict:
 
     tools_section = toml_config.get("tools", {})
 
-    search_section = toml_config.get("search", {})
-    bocha_api_key = os.environ.get("BOCHA_API_KEY", "")
-    if not bocha_api_key:
-        print("警告：未设置 BOCHA_API_KEY 环境变量，web_search 工具将无法使用。")
-
     skills_section = toml_config.get("skills", {})
 
     memory_section = dict(toml_config.get("memory", {}))
@@ -128,12 +123,7 @@ def load_config() -> dict:
             "runtime_constraints_max_items": agent_section.get("runtime_constraints_max_items", 10),
             "runtime_required_outputs_max_items": agent_section.get("runtime_required_outputs_max_items", 8),
         },
-        "search": {
-            "api_key": bocha_api_key,
-            "max_results": search_section.get("max_results", 8),
-            "timeout": search_section.get("timeout", 10),
-            "freshness": search_section.get("freshness", "noLimit"),
-        },
+        "mcp": toml_config.get("mcp", {}),
         "skills": {
             "enabled": skills_section.get("enabled", []),
             "match_top_k": skills_section.get("match_top_k", 2),

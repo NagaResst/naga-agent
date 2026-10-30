@@ -2,9 +2,9 @@
 db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
-default = "GLM-5.3-Coding"
-available = ["GLM-5.3-Coding"]
-base_url = "https://api-opensource-ai.mde.rakuten-it.com/v1" 
+default = "GLM-5.3"
+available = ["GLM-5.3"]
+base_url = ""
 
 
 [delegation]
@@ -42,10 +42,26 @@ runtime_working_set_max_items = 8
 runtime_completed_steps_max_items = 8
 skill_layer_mode = "auto"
 
-[search]
-max_results = 10        # 单次搜索返回最大条数
-timeout = 10           # 请求超时秒数
-freshness = "noLimit"  # 时效过滤：oneDay/oneWeek/oneMonth/noLimit
+[mcp]
+timeout = 20           # 单次 MCP 请求超时秒数
+output_max_chars = 16000
+
+# 按需配置 stdio MCP server；配置后主 Agent 才会看到 mcp 工具。
+# [mcp.servers.example]
+# command = "npx"
+# args = ["-y", "@your-org/your-mcp-server"]
+# cwd = "/path/to/workspace"  # 可选；默认继承当前工作目录
+# [mcp.servers.example.env]
+# EXAMPLE_TOKEN = "${EXAMPLE_TOKEN}"  # 敏感值请从环境变量读取
+
+[mcp.servers.anysearch]
+url = "https://api.anysearch.com/mcp"
+connect_timeout = 60
+enabled = true
+
+[mcp.servers.anysearch.headers]
+Authorization = "Bearer ${ANYSEARCH_API_KEY}"
+X-Anysearch-Client = "mcp/1.0.0"
 
 [skills]
 # 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）

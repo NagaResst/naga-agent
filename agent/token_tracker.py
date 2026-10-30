@@ -90,11 +90,11 @@ class TokenTracker:
         if estimated_prompt_tokens <= 0 or actual_prompt_tokens <= 0:
             return
 
-        ratio = actual_prompt_tokens / max(estimated_prompt_tokens, 1)
-        ratio = min(1.8, max(0.7, ratio))
+        target_multiplier = self._estimate_multiplier * actual_prompt_tokens / estimated_prompt_tokens
+        target_multiplier = min(4.0, max(0.25, target_multiplier))
         alpha = 0.18 if self._calibration_samples < 6 else 0.10
         self._estimate_multiplier = round(
-            max(0.6, min(2.0, ((1 - alpha) * self._estimate_multiplier) + (alpha * ratio))),
+            ((1 - alpha) * self._estimate_multiplier) + (alpha * target_multiplier),
             4,
         )
         self._calibration_samples += 1

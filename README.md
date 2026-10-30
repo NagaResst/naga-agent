@@ -44,7 +44,7 @@ cp .env.example .env
 ```env
 OPENAI_API_KEY=sk-...          # API Key
 OPENAI_BASE_URL=               # 留空使用 OpenAI 官方，填入第三方兼容服务地址
-BOCHA_API_KEY=                 # 博查搜索 API Key，web_search 工具使用
+ANYSEARCH_API_KEY=             # Anysearch MCP 的 Bearer token；不要写入 config.toml
 SUBAGENT_MODEL=                # 子 Agent 使用的低成本模型；留空时不分派
 SUBAGENT_BASE_URL=             # 可选：独立的 OpenAI 兼容地址
 SUBAGENT_API_KEY=              # 使用独立地址时必填
@@ -91,19 +91,18 @@ python3 main.py
 
 ## 工具系统
 
-代理内置 8 个自动注册工具；配置低成本子模型时额外提供 `delegate_tasks` 分派工具：
+代理内置 4 个常驻工具；配置 MCP server 时额外提供 `mcp`，配置低成本子模型时额外提供 `delegate_tasks`：
 
 | 工具 | 说明 |
 |------|------|
 | `execute_command` | 执行本地 Shell 命令，含黑名单拦截和危险命令强制确认 |
 | `read_file` | 读取本地文件内容，支持行范围指定 |
-| `edit_file` | 精确字符串替换编辑文件，编辑前需先 read_file 确认 |
-| `generate_script` | 在 `generated_scripts/` 目录生成脚本文件 |
-| `fetch_url` | 抓取网页正文内容（HTML 转纯文本） |
-| `web_search` | 博查搜索，服务不可用时可回退至 DDG |
 | `memory` | 显式读写核心及情景记忆 |
-| `skill_manager` | 加载、删除或重扫描 Skill |
+| `skill_manager` | 列出、启用、停用或重扫描已安装 Skill，不删除文件 |
+| `mcp` | 列出已配置 MCP server 的工具并调用；未配置时不暴露 |
 | `delegate_tasks` | 按需交给低成本子 Agent，未配置子模型时不提供 |
+
+`config.toml` 已配置 Anysearch Streamable HTTP MCP（60 秒连接超时）。在环境变量或不提交的 `.env` 中设置 `ANYSEARCH_API_KEY`，重启 Agent 后用 `mcp` 的 `list` 查看 `anysearch` 工具目录，指定 `tool` 再次 `list` 查看参数 schema，最后用 `call` 调用。缺少 Key 时不会连接；`X-Anysearch-Client` 已配置为 `mcp/1.0.0`。其他 MCP server 可通过 `[mcp.servers.<name>]` 配置 `url`（HTTP）或 `command`、`args`（stdio）；`enabled = false` 可停用。MCP server 的权限由服务端决定，配置前请核对其提供的读写能力。Skill 文件由用户自行放入 `skills/`，启停可用 `/skill on/off` 或 `skill_manager`。
 
 自定义工具：在 `tools/` 目录下新建 `.py` 文件，实现 `TOOL_DEFINITION` 和 `execute(args)` 即可自动注册。
 
@@ -142,7 +141,7 @@ Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
 
 ## 子任务分派
 
-每条用户消息直接由当前主模型处理，不再先请求分类模型。启用 `[delegation]` 且配置低成本 `model`（或 `SUBAGENT_MODEL`）后，主模型可按需调用 `delegate_tasks`，一次提交最多 `max_tasks` 个独立任务。子任务顺序执行、上下文互不共享，仅可使用 `read_file`、`fetch_url`、`web_search`，结果返回主模型，由主模型完成最终判断和回复。子任务不会再创建子 Agent；其模型用量单独记入会话统计。
+每条用户消息直接由当前主模型处理，不再先请求分类模型。启用 `[delegation]` 且配置低成本 `model`（或 `SUBAGENT_MODEL`）后，主模型可按需调用 `delegate_tasks`，一次提交最多 `max_tasks` 个独立任务。子任务顺序执行、上下文互不共享，仅可使用 `read_file`，结果返回主模型，由主模型完成最终判断和回复。子任务不会再创建子 Agent；其模型用量单独记入会话统计。
 
 `/delegate on/off` 控制当前进程的分派功能；`/model auto` 仅恢复配置中的默认主模型。没有配置子模型时不展示分派工具，不影响主模型直接调用原有工具。
 
@@ -150,7 +149,14 @@ Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
 
 ## 上下文预算
 
-`context_token_limit = 0` 时，Agent 按服务地址和模型名从 provider 元数据探测窗口；已确认值一天后重新验证，可向下更新，探测失败时暂用上次可信值。接口不提供可靠值时回退到 131072 token（128k），实际窗口更小时须手动指定正数覆盖。system 仅包含配置和代码中的固定指令；工具 schema 独立传给模型并先计入预算。启用 Skill 的 frontmatter 构成参考目录，匹配或 `@skill(name)` 指定的正文按预算加载；主题、运行状态、历史摘要、核心与情景记忆都是带标签的参考数据，不作为 system 指令。记忆最多占窗口的 10% 且不超过 2048 token。默认仅最近 3 批配对工具调用和结果进入上下文，旧批次在压缩前成对剔除，不写进摘要；用户请求和助手结论继续保留。思维链只作流式展示，从不写入会话或再次送给模型。输入达到可用预算约 75% 时归档已经完成的旧轮次，并在 SQLite 保存摘要覆盖 ID；原始工具结果仍留在 SQLite 供追溯，清空会话时删除。过长工具输出仅截断发送副本；最新用户输入仍放不下时会明确报错。子 Agent 使用相同预算算法，其窗口可用 `[delegation].context_token_limit` 覆盖。`/token` 显示最近一次上下文估算和摘要进度；估算与 API usage 校准，不保证精确。
+`context_token_limit = 0` 时，Agent 按服务地址和模型名从 provider 元数据探测窗口；已确认值一天后重新验证，可向下更新，探测失败时暂用上次可信值。接口不提供可靠值时回退到 131072 token（128k），实际窗口更小时须手动指定正数覆盖。system 仅包含配置和代码中的固定指令；工具 schema 独立传给模型并先计入预算。所有 Skill 的原始 frontmatter 始终作为参考目录注入；自动匹配的正文按预算加载，`/{skillname}` 指定时注入入口文件全文；主题、运行状态、历史摘要、核心与情景记忆都是带标签的参考数据，不作为 system 指令。记忆最多占窗口的 10% 且不超过 2048 token。默认仅最近 3 批配对工具调用和结果进入上下文，旧批次在压缩前成对剔除，不写进摘要；用户请求和助手结论继续保留。思维链只作流式展示，从不写入会话或再次送给模型。输入达到可用预算约 75% 时归档已经完成的旧轮次，并在 SQLite 保存摘要覆盖 ID；原始工具结果仍留在 SQLite 供追溯，清空会话时删除。过长工具输出仅截断发送副本；最新用户输入仍放不下时会明确报错。子 Agent 使用相同预算算法，其窗口可用 `[delegation].context_token_limit` 覆盖。`/token` 显示最近一次上下文估算和摘要进度；估算与 API usage 校准，不保证精确。
+
+底部状态栏以绿色旋转圆圈 / 灰色空心圆 `○` 标识是否有正在处理或排队的消息，并显示最近一次实际发送请求的输入估算（消息加工具 schema），不是持久化历史的累计值；`/token` 可查看消息、schema 和 API 返回的最近真实输入。预留的生成空间不算作已用 token。GLM 等模型与 `tiktoken` 编码不完全一致，估算会随 API usage 渐进校准。若首次启动显示 `unavailable` 且编码下载遇到证书错误，可在项目虚拟环境中用系统证书链缓存编码（不关闭 TLS 验证）：
+
+```bash
+python3 -m pip --use-feature=truststore install truststore
+python3 -c 'import truststore; truststore.inject_into_ssl(); import tiktoken; tiktoken.get_encoding("cl100k_base")'
+```
 
 ---
 
@@ -181,6 +187,7 @@ enabled: false
 | 查看所有 Skill | `/skill list` |
 | 激活 Skill | `/skill on ops-expert` |
 | 停用 Skill | `/skill off ops-expert` |
+| 显式使用 Skill | `/ops-expert 帮我排查 Pod 重启` |
 
 也可在 `config.toml` 中预设激活列表：
 
@@ -192,9 +199,9 @@ summary_top_k = 6
 min_match_score = 2.2
 ```
 
-匹配策略说明：Agent 以 `name`、`keywords`、`examples` 计算匹配分数，按 `min_match_score` 和 `match_top_k` 选取正文；启用 Skill 的 frontmatter 以目录形式保留，正文受独立 token 限额约束，过长时提示按需读取入口文件。
+匹配策略说明：Agent 以 `name`、`keywords`、`examples` 计算匹配分数，按 `min_match_score` 和 `match_top_k` 选取自动匹配的正文；所有 Skill（含停用）的原始 frontmatter 始终作为参考目录注入。自动匹配正文受独立 token 限额约束，显式指定则注入该 Skill 入口文件全文；目录或全文超出上下文窗口时明确报错，不截断原文。
 
-如果你想在对话里强制使用某个 Skill，可以在用户消息里显式写 `@skill(skill-name)`，例如 `@skill(fund-deep-research) 帮我分析 007119`。这样该 Skill 会被直接提升到注入优先级最高。
+在消息开头写 `/{skillname}` 只使用指定的已启用 Skill，例如 `/fund-deep-research 帮我分析 007119`。停用的 Skill 不会自动匹配，也不能被显式指定；可用 `/skill on <名称>` 或 `skill_manager` 工具启用。模型通过工具在当前轮启用 Skill 时，可先读取工具返回的入口文件；从下一条用户消息起参与自动匹配。启停在当前进程内生效，重启后按配置或 frontmatter 重新加载。
 
 ---
 
@@ -209,6 +216,7 @@ min_match_score = 2.2
 | `/thinking show/hide` | 显示/隐藏思考过程 |
 | `/skill list` | 查看所有 Skill |
 | `/skill on/off <名称>` | 激活/停用 Skill |
+| `/<Skill 名称> <任务>` | 显式使用已启用的 Skill |
 | `/session` | 当前会话信息（含 token 和费用） |
 | `/session new` | 创建并切换到新会话 |
 | `/session list` | 列出最近 10 条历史会话 |
@@ -222,6 +230,8 @@ min_match_score = 2.2
 | `/delegate on/off` | 开关低成本子任务分派 |
 | `/clear` | 清除当前会话历史 |
 | `/quit` | 退出 |
+
+回复显示在输入行上方的独立输出区；载入旧会话或用 `/session switch` 切换时，会回显全部有正文的用户和助手消息，不显示工具记录，也不会截断消息。AI 回复在生成时流式更新 Markdown（标题、列表、表格、代码块等），完成后再做一次最终渲染；整篇回复以 `markdown` 代码围栏包裹时也会作为正文渲染，其他语言的代码块仍显示为代码。新回复会保留原始 Markdown 供以后载入，旧记录中已被去除的标记无法恢复。用户消息保持原文。每条消息以分隔线标明角色和时间；AI 回复显示用时，旧记录的用时按用户消息到助手消息的存储时间差计算，无有效时间戳时不显示。按 `↑` / `↓` 逐行滚动消息区；终端未拦截时也可用 `PageUp` / `PageDown` 整页滚动。方向键用于消息区，不再用于输入历史导航。新提交的消息同样会显示在输出区。生成期间输入行和底部状态栏会保持可见，分隔线将回复内容与输入行分隔开。可以继续输入消息，新消息会按提交顺序等待处理。正在回复时不能切换会话或修改模型等设置。如需确认命令，未提交的草稿会暂存，输入行临时用于确认，回答后恢复草稿和光标位置。
 
 ---
 
@@ -292,11 +302,9 @@ naga-agent/
 │   └── sqlite_session.py     # SQLite 会话持久化（会话、消息、记忆、摘要）
 ├── tools/                    # 工具模块（自动注册）
 │   ├── execute_command.py
-│   ├── edit_file.py
 │   ├── read_file.py
-│   ├── generate_script.py
-│   ├── fetch_url.py
-│   ├── web_search.py
+│   ├── mcp.py
+│   ├── skill_manager.py
 │   └── memory.py
 ├── skills/                   # Skill 提示词（.md 格式）
 └── generated_scripts/        # 生成的脚本和提示词文件
