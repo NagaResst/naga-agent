@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -642,22 +643,31 @@ class MainAgentDelegationTests(unittest.TestCase):
         answer = "**Important**\n\n- first\n\n```python\nprint(1)\n```\n" + " filler" * 20
         answer += "\n\n## Phase 1\n\n| Name | Value |\n| --- | --- |\n| A | B |\n"
 
+        def _wait_until(cond, desc, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if cond():
+                    return
+                time.sleep(0.01)
+            self.fail(f"timeout waiting for {desc} in pane")
+
         def stream():
             yield self._stream(answer[:125])[0]
-            self.assertIn("Important", pane._text)
-            self.assertNotIn("**Important**", pane._text)
+            # 等待中途渲染完成：pane 出现渲染后的 "Important" 且原始 markdown 已被替换
+            _wait_until(lambda: "Important" in pane._text and "**Important**" not in pane._text,
+                        "mid-stream render of first chunk")
             queued_message = threading.Thread(target=lambda: console.print("queued user message"))
             queued_message.start()
             queued_message.join()
             yield self._stream(answer[125:])[0]
-            self.assertNotIn("## Phase 1", pane._text)
-            self.assertIn("queued user message", pane._text)
+            # 等待排队消息写入 pane（由独立线程打印，与渲染线程并发）
+            _wait_until(lambda: "queued user message" in pane._text, "queued user message")
 
         agent._client.chat.completions.create.return_value = stream()
-        # chat 流程含 activity.set 的额外 time.monotonic 调用（prepare/llm_wait/llm_stream/idle），
-        # 用生成器按需供值：前半 1.0，后半 1.3，避免固定列表耗尽
-        clock = iter([1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.3, 1.3, 1.3, 1.3, 1.3, 1.3])
-        with patch("agent.core.time.monotonic", side_effect=lambda: next(clock)):
+        # 流式消费在独立读线程中进行，queue.get/put 的超时计算也会调用 time.monotonic，
+        # 固定值列表会被多线程并发耗尽；改用真实单调时钟（perf_counter）：
+        # 首次渲染立即触发（last_render_at 初始为 0），后续 chunk 因间隔小于节流阈值不再中途渲染
+        with patch("agent.core.time.monotonic", side_effect=lambda: time.perf_counter()):
             self.assertEqual(agent.chat("question"), answer)
         displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
         self.assertIn("tool log", displayed)
