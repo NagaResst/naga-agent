@@ -1,5 +1,6 @@
 import json
 import atexit
+import queue
 import re
 import subprocess
 import sys
@@ -39,8 +40,54 @@ def markdown_body(content: str) -> str:
     return content
 
 
+class InstructionBuffer:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._open = False
+        self._pending = []
+
+    def open(self):
+        with self._lock:
+            self._open = True
+
+    def insert(self, text: str) -> bool:
+        with self._lock:
+            if not self._open:
+                return False
+            self._pending.append(text)
+            return True
+
+    def take(self) -> list[str]:
+        with self._lock:
+            pending, self._pending = self._pending, []
+            return pending
+
+    def restore(self, pending: list[str]):
+        with self._lock:
+            self._pending[0:0] = pending
+
+    def continue_or_close(self) -> bool:
+        with self._lock:
+            if self._pending:
+                return True
+            self._open = False
+            return False
+
+    def close(self) -> list[str]:
+        with self._lock:
+            self._open = False
+            pending, self._pending = self._pending, []
+            return pending
+
+
 class Agent:
     _RUNTIME_STATE_MARKER = "【固定约束与运行状态】"
+    _INSERTION_MARKER = "【任务中插入的用户指令】"
+
+    @classmethod
+    def _is_turn_start(cls, message: dict) -> bool:
+        return (message.get("role") == "user"
+                and not (message.get("content") or "").startswith(cls._INSERTION_MARKER))
 
     def __init__(self, config: dict, session_manager, session_id: str, model: str, console):
         self.config = config
@@ -49,6 +96,10 @@ class Agent:
         self.model = model
         self.console = console
         self.activity = ActivityTracker()
+        self._cancel_event = None
+        self._active_stream_lock = threading.Lock()
+        self._active_stream = None
+        self._active_stream_closing = None
         self.auto_confirm = config["agent"]["auto_confirm"]
         self.max_history = config["agent"]["max_history"]
 
@@ -176,6 +227,7 @@ class Agent:
                     context_token_limit=delegation.get("context_token_limit", 0),
                     base_url=delegation.get("base_url") or config.get("base_url"),
                     tool_dispatcher=self._call_tool,
+                    cancelled=lambda: self._cancel_event is not None and self._cancel_event.is_set(),
                 )
 
         # 启动时扫描并加载 skills/ 目录下所有 skill
@@ -773,7 +825,7 @@ class Agent:
     def _compact_history(self, rows: list[dict], summary: dict, prefix: list[dict], budget: int) -> tuple[list[dict], dict]:
         turns = []
         for row in rows:
-            if row["role"] == "user" or not turns:
+            if self._is_turn_start(row) or not turns:
                 turns.append([])
             turns[-1].append(row)
         if len(turns) < 2:
@@ -997,7 +1049,7 @@ class Agent:
         keep_rounds = max(0, int(self.config.get("agent", {}).get("tool_result_keep_rounds", 3)))
         batches = []
         latest_user_index = max(
-            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            (index for index, message in enumerate(messages) if self._is_turn_start(message)),
             default=-1,
         )
         for index, message in enumerate(messages):
@@ -1041,7 +1093,7 @@ class Agent:
         for message in messages:
             if message.get("role") == "system" or message in summary or message in skill_references:
                 continue
-            if message.get("role") == "user" or not turns:
+            if self._is_turn_start(message) or not turns:
                 turns.append([])
             turns[-1].append(message)
 
@@ -1094,6 +1146,37 @@ class Agent:
                 return False
         return False
 
+    @staticmethod
+    def _has_text_tool_call(content: str) -> bool:
+        lines = content.splitlines(keepends=True)
+        for token in MarkdownIt().parse(content):
+            if token.type in ("fence", "code_block") and token.map:
+                for index in range(*token.map):
+                    lines[index] = ""
+        return bool(re.search(
+            r"<tool_call>\s*[A-Za-z_][\w.-]*\s*<arg_key>.*?</arg_key>\s*<arg_value>",
+            "".join(lines), re.DOTALL,
+        ))
+
+    @staticmethod
+    def _valid_tool_calls(calls: list[dict]) -> bool:
+        ids = set()
+        for call in calls:
+            call_id = call.get("id")
+            function = call.get("function") or {}
+            if not isinstance(call_id, str) or not call_id or call_id in ids:
+                return False
+            if not isinstance(function.get("name"), str) or not function["name"]:
+                return False
+            try:
+                arguments = json.loads(function.get("arguments", ""))
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(arguments, dict):
+                return False
+            ids.add(call_id)
+        return bool(calls)
+
     def _call_tool(self, name: str, args: dict) -> str:
         if name == "delegate_tasks":
             if not self._subtask_runner or not self.config.get("delegation", {}).get("enabled"):
@@ -1144,10 +1227,27 @@ class Agent:
         if tool_name == "mcp":
             return "⏳ 正在调用 MCP 工具…"
         if tool_name == "read_file":
-            return f"⏳ 正在读取文件…"
+            return f"⏳ 正在读取文件：{tool_args.get('path', '')}，{self._read_file_range(tool_args)}"
         if tool_name == "memory":
             return f"⏳ 正在操作记忆…"
         return "⏳ 正在处理，请稍候…"
+
+    @staticmethod
+    def _read_file_range(args: dict) -> str:
+        start = args.get("start_line") or 1
+        end = args.get("end_line") or "文件末尾"
+        return f"请求行范围：{start}-{end}"
+
+    @staticmethod
+    def _read_file_result_summary(result: str) -> str:
+        if result.startswith("错误："):
+            return f"读取失败：{result}"
+        header = result.split("\n---\n", 1)[0].splitlines()
+        line_range = next((line for line in header if line.startswith("行范围：")), None)
+        returned = next((line for line in header if line.startswith("实际返回：")), None)
+        if line_range and returned:
+            return f"{line_range}；{returned}"
+        return "读取结果缺少行范围或实际返回行数"
 
     @staticmethod
     def _strip_markdown(text: str) -> str:
@@ -1193,7 +1293,90 @@ class Agent:
         extra_body = {k: v for k, v in merged.items() if k not in self._OPENAI_TOP_LEVEL_PARAMS}
         return (extra_body or None), (top_level or None)
 
+    def cancel_active_stream(self):
+        lock = getattr(self, "_active_stream_lock", None)
+        if lock is None:
+            return
+        with lock:
+            stream = self._active_stream
+            close = getattr(stream, "close", None)
+            if close is None or getattr(self, "_active_stream_closing", None) is stream:
+                return
+            self._active_stream_closing = stream
+
+        def close_stream():
+            try:
+                close()
+            except Exception as exc:
+                self.console.print(f"关闭模型流失败：{exc}", style="yellow", markup=False, highlight=False)
+            finally:
+                with lock:
+                    if self._active_stream_closing is stream:
+                        self._active_stream_closing = None
+
+        threading.Thread(target=close_stream, daemon=True).start()
+
+    def _iterate_stream(self, stream, cancelled):
+        lock = getattr(self, "_active_stream_lock", None)
+        items = queue.Queue(maxsize=1)
+        stop_reader = threading.Event()
+
+        def publish(item):
+            while not stop_reader.is_set():
+                try:
+                    items.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+
+        def read_stream():
+            try:
+                for chunk in stream:
+                    if stop_reader.is_set():
+                        return
+                    publish(("chunk", chunk))
+                    if stop_reader.is_set():
+                        return
+            except Exception as exc:
+                publish(("error", exc))
+            else:
+                publish(("done", None))
+
+        if lock is not None:
+            with lock:
+                self._active_stream = stream
+            if cancelled():
+                self.cancel_active_stream()
+        try:
+            if cancelled():
+                return
+            threading.Thread(target=read_stream, daemon=True).start()
+            while not cancelled():
+                try:
+                    kind, item = items.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if cancelled():
+                    break
+                if kind == "done":
+                    break
+                if kind == "error":
+                    raise item
+                yield item
+        finally:
+            stop_reader.set()
+            if cancelled():
+                self.cancel_active_stream()
+            if lock is not None:
+                with lock:
+                    if self._active_stream is stream:
+                        self._active_stream = None
+
     def chat(self, user_input: str) -> str:
+        cancel_event = getattr(self, "_cancel_event", None)
+        def cancelled():
+            return cancel_event is not None and cancel_event.is_set()
+
         self.activity.set("prepare")
         self._delegation_calls = 0
         self._snapshot_runtime_state()
@@ -1223,8 +1406,25 @@ class Agent:
 
             step_round_count = 0
             step_error_count = 0
+            malformed_tool_retries = 0
 
             while True:
+                if cancelled():
+                    self.console.print("[yellow]任务已中断。[/yellow]")
+                    return "[任务已中断]"
+                insertions = getattr(self, "_insertions", None)
+                pending = insertions.take() if insertions else []
+                if pending:
+                    inserted_messages = [
+                        {"role": "user", "content": f"{self._INSERTION_MARKER}\n{text}"}
+                        for text in pending
+                    ]
+                    try:
+                        self.session_manager.append_messages(self.session_id, inserted_messages)
+                    except Exception:
+                        insertions.restore(pending)
+                        raise
+                    messages.extend(inserted_messages)
                 _last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
                 _active_tools = self._select_tools(_last_user) if step_round_count < tool_max_rounds and step_error_count < tool_max_errors else None
                 context_window = getattr(self, "_context_window", 0) or get_context_window(
@@ -1295,6 +1495,7 @@ class Agent:
 
                 full_content = ""
                 response_pane = self.console.file if isinstance(self.console, Console) and hasattr(self.console.file, "start_response") else None
+                reasoning_pane = self.console.file if isinstance(self.console, Console) and hasattr(self.console.file, "write_reasoning") else None
                 response_started = False
                 last_render_at = 0.0
 
@@ -1328,7 +1529,9 @@ class Agent:
                 in_reasoning = False
                 call_input_tokens = 0
 
-                for chunk in stream:
+                for chunk in self._iterate_stream(stream, cancelled):
+                    if cancelled():
+                        break
                     if hasattr(chunk, "usage") and chunk.usage is not None:
                         prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
                         completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
@@ -1345,14 +1548,23 @@ class Agent:
                     if rc:
                         if not in_reasoning:
                             self.activity.set("reasoning")
-                            if self.config["agent"].get("show_thinking", True):
+                            if reasoning_pane:
+                                reasoning_pane.start_reasoning()
+                                reasoning_pane.write_reasoning("\n\x1b[2;3m思考过程：\x1b[0m\n")
+                            elif self.config["agent"].get("show_thinking", True):
                                 self.console.print("\n[dim italic]思考中...[/dim italic]")
                             in_reasoning = True
-                        if self.config["agent"].get("show_thinking", True):
-                            self.console.print(f"[dim]{rc}[/dim]", end="")
+                        if reasoning_pane:
+                            with self.console.capture() as reasoning_capture:
+                                self.console.print(rc, style="dim", markup=False, highlight=False, end="")
+                            reasoning_pane.write_reasoning(reasoning_capture.get())
+                        elif self.config["agent"].get("show_thinking", True):
+                            self.console.print(rc, style="dim", markup=False, highlight=False, end="")
 
                     if delta.content:
                         if in_reasoning:
+                            if reasoning_pane:
+                                reasoning_pane.end_reasoning()
                             self.console.print()
                             in_reasoning = False
                         if not response_started:
@@ -1409,12 +1621,53 @@ class Agent:
                         call_input_tokens,
                     )
 
+                if in_reasoning and reasoning_pane:
+                    reasoning_pane.end_reasoning()
                 if full_content or in_reasoning:
                     self.console.print()
                 if response_started:
                     render_response(final=True)
 
-                if finish_reason != "tool_calls":
+                if cancelled():
+                    self.console.print("[yellow]任务已中断。[/yellow]")
+                    return (full_content.strip() + "\n\n" if full_content.strip() else "") + "[任务已中断]"
+
+                malformed_tool_call = (
+                    (bool(tool_calls_acc) and
+                     (finish_reason == "length" or not self._valid_tool_calls(tool_calls_acc)))
+                    or (finish_reason == "tool_calls" and not tool_calls_acc)
+                    or (not tool_calls_acc and self._has_text_tool_call(full_content))
+                )
+                if malformed_tool_call:
+                    if _active_tools is not None and malformed_tool_retries < 1:
+                        malformed_tool_retries += 1
+                        self.console.print(
+                            "模型返回了无效的工具调用，正在要求重新生成结构化调用；原始文本不会执行。",
+                            style="yellow",
+                        )
+                        messages.extend([
+                            {"role": "assistant", "content": full_content or "[无效工具调用]"},
+                            {"role": "user", "content": (
+                                "上一次工具调用格式无效，未执行。请根据当前任务重新决定下一步；"
+                                "如需调用工具，请使用标准结构化工具调用，不要把工具调用写成正文。"
+                            )},
+                        ])
+                        continue
+                    error = "错误：模型未返回有效的结构化工具调用，任务未完成；原始工具调用文本未执行，请重试。"
+                    self.console.print(error, style="bold red", markup=False, highlight=False)
+                    return error
+
+                if not tool_calls_acc:
+                    if finish_reason == "length":
+                        error = "错误：模型输出因长度限制被截断，任务可能未完成。"
+                        self.console.print(error, style="bold red", markup=False, highlight=False)
+                        return ((full_content.strip() + "\n\n") if full_content.strip() else "") + error
+                    if insertions and insertions.continue_or_close():
+                        if full_content.strip():
+                            assistant_message = {"role": "assistant", "content": full_content}
+                            self.session_manager.append_messages(self.session_id, [assistant_message])
+                            messages.append(assistant_message)
+                        continue
                     if full_content.strip():
                         return full_content
                     if _active_tools is None and (step_round_count >= tool_max_rounds or step_error_count >= tool_max_errors):
@@ -1422,8 +1675,11 @@ class Agent:
                     return "模型未返回有效答复，请重试。"
 
                 if _active_tools is None:
-                    return full_content.strip() or "工具调用已达限制，无法继续执行；请检查已有结果后重试。"
+                    error = "错误：工具调用已达限制，模型返回的工具调用未执行；请检查已有结果后重试。"
+                    self.console.print(error, style="bold red", markup=False, highlight=False)
+                    return error
 
+                malformed_tool_retries = 0
                 step_round_count += 1
 
                 messages.append({
@@ -1440,6 +1696,13 @@ class Agent:
 
                 for tc in tool_calls_acc:
                     tool_name = tc["function"]["name"]
+                    if cancelled():
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc["id"], "name": tool_name,
+                            "content": "错误：任务已中断，此工具未执行。",
+                        })
+                        tool_batch.append(messages[-1])
+                        continue
                     try:
                         tool_args = json.loads(tc["function"]["arguments"])
                     except json.JSONDecodeError:
@@ -1458,12 +1721,20 @@ class Agent:
                         elif tool_name == "mcp":
                             self.console.print(f"[dim]MCP：{tool_args.get('server', '')}/{tool_args.get('tool', '')}[/dim]")
                         elif tool_name == "read_file":
-                            self.console.print(f"[dim]读取：{tool_args.get('path', '')}[/dim]")
+                            self.console.print(
+                                f"读取：{tool_args.get('path', '')}，{self._read_file_range(tool_args)}",
+                                style="dim", markup=False, highlight=False,
+                            )
                     else:
                         hint = self._humanize_tool_hint(tool_name, tool_args)
-                        self.console.print(f"[dim italic]{hint}[/dim italic]")
+                        self.console.print(hint, style="dim italic", markup=False, highlight=False)
 
                     tool_result = self._call_tool(tool_name, tool_args)
+                    if tool_name == "read_file":
+                        self.console.print(
+                            self._read_file_result_summary(tool_result),
+                            style="dim", markup=False, highlight=False,
+                        )
                     self._record_tool_event(tool_name, tool_args, tool_result)
                     self._upsert_runtime_state_message(messages)
 
@@ -1482,14 +1753,15 @@ class Agent:
                 self.session_manager.append_messages(self.session_id, tool_batch)
 
         last_content = _run_tool_loop()
-        reply_summary = self._summarize_reply_conclusion(last_content)
-        if reply_summary:
-            self._add_working_set_item(reply_summary)
-        pending_step = self._extract_pending_step(last_content)
-        if pending_step:
-            self._set_pending_step(pending_step)
-            if not self._runtime_task_state.get("current_step"):
-                self._set_current_step(pending_step)
+        if not cancelled():
+            reply_summary = self._summarize_reply_conclusion(last_content)
+            if reply_summary:
+                self._add_working_set_item(reply_summary)
+            pending_step = self._extract_pending_step(last_content)
+            if pending_step:
+                self._set_pending_step(pending_step)
+                if not self._runtime_task_state.get("current_step"):
+                    self._set_current_step(pending_step)
 
         # 记录 session + token + 记忆
         self.session_manager.append_message(self.session_id, "assistant", last_content)
@@ -1498,7 +1770,7 @@ class Agent:
                 self.session_manager, self.session_id, active_model,
                 {"prompt_tokens": _acc_input, "completion_tokens": _acc_output},
             )
-        if self._memory_manager and self._memory_manager.available:
+        if not cancelled() and self._memory_manager and self._memory_manager.available:
             self._memory_manager.increment_turn()
             if self._memory_manager.should_extract():
                 extract_turns = self.config.get("memory", {}).get("extract_history_turns", 20)

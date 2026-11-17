@@ -8,6 +8,7 @@ import unittest
 from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from rich.console import Console
@@ -19,6 +20,7 @@ from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.layout.controls import FormattedTextControl
 
 from agent.core import Agent
+from agent.subagent import SubtaskRunner
 from main import ChatRunner, DialogueHistoryPager, OutputPane, _invoked_skill, _paint_status_line, _show_dialogue_history
 from session.sqlite_session import SessionManager
 from tools import mcp, read_file, skill_manager
@@ -55,7 +57,80 @@ class ToolTests(unittest.TestCase):
             result = read_file.execute({"path": str(path)})
 
         self.assertIn("已截断", result)
+        self.assertIn("实际返回：1 行（已截断，末行不完整）", result)
         self.assertLess(len(result), 12500)
+
+    def test_read_file_reports_requested_range_and_returned_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lines.txt"
+            path.write_text("first\nsecond\nthird\nfourth\n", encoding="utf-8")
+            args = {"path": str(path), "start_line": 2, "end_line": 3}
+            result = read_file.execute(args)
+
+        self.assertIn("请求行范围：2-3", Agent._read_file_range(args))
+        self.assertEqual(Agent._read_file_result_summary(result),
+                         "行范围：2-3 / 共 4 行；实际返回：2 行")
+        self.assertEqual(Agent._read_file_result_summary("错误：文件不存在"),
+                         "读取失败：错误：文件不存在")
+
+    def test_text_tool_call_detection_ignores_fenced_examples(self):
+        text = "<tool_call>execute_command<arg_key>command</arg_key><arg_value>echo test</arg_value></tool_call>"
+        self.assertTrue(Agent._has_text_tool_call(text))
+        self.assertFalse(Agent._has_text_tool_call(f"Example:\n```xml\n{text}\n```"))
+        self.assertFalse(Agent._has_text_tool_call("工具调用已完成"))
+
+    def test_structured_tool_call_requires_valid_identifiers_and_object_arguments(self):
+        valid = {"id": "call", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}
+        self.assertTrue(Agent._valid_tool_calls([valid]))
+        self.assertFalse(Agent._valid_tool_calls([valid, valid]))
+        self.assertFalse(Agent._valid_tool_calls([
+            {"id": "call", "function": {"name": "read_file", "arguments": "["}},
+        ]))
+        self.assertFalse(Agent._valid_tool_calls([
+            {"id": "call", "function": {"name": "read_file", "arguments": "[]"}},
+        ]))
+
+    def test_text_tool_call_is_retried_but_never_executed_directly(self):
+        agent = Agent.__new__(Agent)
+        agent.activity = Mock()
+        agent.config = {"agent": {"show_thinking": False}, "model": {"extra_params": {}},
+                        "tools": {}, "delegation": {}}
+        agent.model = "test"
+        agent.session_id = "session"
+        agent.session_manager = Mock()
+        agent.console = Console(file=StringIO(), width=100, color_system=None)
+        agent._token_tracker = Mock()
+        agent._token_tracker.estimate.return_value = 1
+        agent._token_tracker.estimate_tools.return_value = 1
+        agent._memory_manager = None
+        agent._snapshot_runtime_state = Mock()
+        agent._reset_runtime_state = Mock()
+        agent._restore_followup_state = Mock()
+        agent._get_messages = Mock(return_value=[{"role": "user", "content": "question"}])
+        agent._upsert_runtime_state_message = Mock()
+        agent._select_tools = Mock(return_value=[{"type": "function", "function": {"name": "read_file"}}])
+        agent._fit_messages = Mock(side_effect=lambda messages, *_: messages)
+        agent._summarize_reply_conclusion = Mock(return_value="")
+        agent._record_tool_event = Mock()
+        agent._call_tool = Mock(return_value="file result")
+        agent._client = Mock()
+        agent._context_window = 4096
+
+        def chunk(content=None, calls=None, finish="stop"):
+            delta = SimpleNamespace(content=content, reasoning_content=None, tool_calls=calls or [])
+            return SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=delta, finish_reason=finish)])
+
+        bad = "<tool_call>execute_command<arg_key>command</arg_key><arg_value>unsafe</arg_value></tool_call>"
+        call = SimpleNamespace(index=0, id="call1", function=SimpleNamespace(
+            name="read_file", arguments='{"path":"safe.txt"}',
+        ))
+        agent._client.chat.completions.create.side_effect = [
+            [chunk(bad)], [chunk(calls=[call], finish="tool_calls")], [chunk("done")],
+        ]
+
+        self.assertEqual(agent.chat("question"), "done")
+        self.assertEqual(agent._client.chat.completions.create.call_count, 3)
+        agent._call_tool.assert_called_once_with("read_file", {"path": "safe.txt"})
 
     def test_skill_command_recognizes_only_exact_leading_name(self):
         skills = [{"name": "review", "enabled": True}]
@@ -137,6 +212,54 @@ class ToolTests(unittest.TestCase):
         pane.write(" second")
         self.assertIsNot(pane.formatted_text(), snapshot)
         self.assertEqual(fragment_list_to_text(to_formatted_text(pane.formatted_text())), "first second")
+
+    def test_reasoning_fold_retains_all_chunks_and_interleaved_output(self):
+        pane = OutputPane(Mock(), show_thinking=False)
+        pane.start_reasoning()
+        pane.write_reasoning("first ")
+        pane.write("queued message\n")
+        pane.write_reasoning("second")
+        pane.end_reasoning()
+        pane.start_response()
+        pane.write("raw answer")
+        pane.finish_response("final answer")
+
+        collapsed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertIn("思考过程已折叠", collapsed)
+        self.assertNotIn("first ", collapsed)
+        pane.set_thinking_expanded(True)
+        expanded = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertIn("first queued message\nsecond", expanded)
+        self.assertIn("final answer", expanded)
+        pane.set_thinking_expanded(False)
+        self.assertNotIn("first ", fragment_list_to_text(to_formatted_text(pane.formatted_text())))
+        pane.set_thinking_expanded(True)
+        self.assertEqual(fragment_list_to_text(to_formatted_text(pane.formatted_text())), expanded)
+
+    def test_reasoning_fold_during_active_response_keeps_offsets(self):
+        pane = OutputPane(Mock())
+        pane.start_response()
+        pane.write("raw ")
+        pane.start_reasoning()
+        pane.write_reasoning("reason")
+        pane.end_reasoning()
+        pane.write("answer")
+        pane.set_thinking_expanded(False)
+        pane.finish_response("final")
+        pane.set_thinking_expanded(True)
+        displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertIn("reason", displayed)
+        self.assertIn("final", displayed)
+        self.assertNotIn("raw", displayed)
+
+    def test_folded_reasoning_keeps_existing_scroll_anchor(self):
+        pane = OutputPane(Mock(), show_thinking=False)
+        pane.write("".join(f"line {number}\n" for number in range(50)))
+        pane.scroll(10)
+        before = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        pane.start_reasoning()
+        pane.write_reasoning("hidden")
+        self.assertEqual(fragment_list_to_text(to_formatted_text(pane.formatted_text())), before)
 
     def test_history_pager_loads_complete_turns_without_duplicates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,6 +413,192 @@ class ToolTests(unittest.TestCase):
                 runner.answer_confirmation("n")
             runner.close()
         self.assertIs(console.input, runner._original_input)
+
+    def test_chat_runner_reports_markup_exception_and_continues(self):
+        output = StringIO()
+        console = Console(file=output, width=100, color_system=None)
+        agent = Mock()
+        finished = threading.Event()
+
+        def chat(text):
+            if text == "first":
+                raise ValueError("closing tag '[/dim]' was unexpected")
+            finished.set()
+
+        agent.chat.side_effect = chat
+        prompt_session = Mock()
+        runner = ChatRunner(agent, console, prompt_session, Mock())
+        try:
+            runner.submit("first", "session")
+            runner.submit("second", "session")
+            self.assertTrue(finished.wait(2))
+        finally:
+            runner.close()
+        self.assertIn("closing tag '[/dim]' was unexpected", output.getvalue())
+
+    def test_cancel_current_does_not_cancel_queued_job(self):
+        started = threading.Event()
+        completed = threading.Event()
+        agent = Mock()
+        calls = []
+
+        def chat(text):
+            calls.append(text)
+            if text == "first":
+                started.set()
+                self.assertTrue(agent._cancel_event.wait(2))
+            else:
+                self.assertFalse(agent._cancel_event.is_set())
+                completed.set()
+
+        agent.chat.side_effect = chat
+        runner = ChatRunner(agent, Mock(), Mock(), Mock())
+        try:
+            runner.submit("first", "session")
+            self.assertTrue(started.wait(2))
+            runner.submit("second", "session")
+            self.assertTrue(runner.cancel_current())
+            self.assertTrue(completed.wait(2))
+            self.assertEqual(calls, ["first", "second"])
+        finally:
+            runner.close()
+
+    def test_cancel_stops_waiting_for_a_stalled_reasoning_stream(self):
+        blocked = threading.Event()
+        release = threading.Event()
+        cancel = threading.Event()
+        finished = threading.Event()
+        first_received = threading.Event()
+        received = []
+        errors = []
+
+        class Stream:
+            def __iter__(self):
+                yield "reasoning"
+                blocked.set()
+                release.wait()
+                yield "late"
+
+            def close(self):
+                pass
+
+        agent = Agent.__new__(Agent)
+        agent._active_stream_lock = threading.Lock()
+        agent._active_stream = None
+        agent.console = Mock()
+
+        def consume():
+            try:
+                for chunk in agent._iterate_stream(Stream(), cancel.is_set):
+                    received.append(chunk)
+                    first_received.set()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=consume, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(first_received.wait(2))
+            self.assertTrue(blocked.wait(2))
+            cancel.set()
+            agent.cancel_active_stream()
+            self.assertTrue(finished.wait(1))
+            self.assertEqual(received, ["reasoning"])
+            self.assertEqual(errors, [])
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_cancel_closes_stream_before_next_queued_job_starts(self):
+        started = threading.Event()
+        first_returned = threading.Event()
+        close_started = threading.Event()
+        release_close = threading.Event()
+        second_started = threading.Event()
+        agent = Mock()
+
+        def chat(text):
+            if text == "first":
+                started.set()
+                agent._cancel_event.wait(2)
+                first_returned.set()
+            else:
+                second_started.set()
+
+        def close_stream():
+            close_started.set()
+            release_close.wait()
+
+        agent.chat.side_effect = chat
+        agent.cancel_active_stream.side_effect = close_stream
+        runner = ChatRunner(agent, Mock(), Mock(), Mock())
+        cancel_thread = None
+        try:
+            runner.submit("first", "session")
+            self.assertTrue(started.wait(2))
+            runner.submit("second", "session")
+            cancel_thread = threading.Thread(target=runner.cancel_current, daemon=True)
+            cancel_thread.start()
+            self.assertTrue(close_started.wait(2))
+            self.assertTrue(first_returned.wait(2))
+            self.assertFalse(second_started.wait(0.1))
+            release_close.set()
+            self.assertTrue(second_started.wait(2))
+        finally:
+            release_close.set()
+            if cancel_thread is not None:
+                cancel_thread.join(2)
+            runner.close()
+
+    def test_subagent_stops_before_following_tasks_after_cancellation(self):
+        cancelled = threading.Event()
+        client = Mock()
+
+        def complete(**kwargs):
+            cancelled.set()
+            return SimpleNamespace(
+                usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=[]))]
+            )
+
+        client.chat.completions.create.side_effect = complete
+        runner = SubtaskRunner(client, "child", [], {}, Mock(), cancelled=cancelled.is_set)
+        result = runner.execute({"tasks": [{"task": "first"}, {"task": "second"}]})
+        self.assertIn("已中断", result)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+
+    def test_chat_renders_reasoning_as_literal_text(self):
+        output = StringIO()
+        agent = Agent.__new__(Agent)
+        agent.activity = Mock()
+        agent.config = {"agent": {"show_thinking": True, "context_token_limit": 4096},
+                        "model": {"extra_params": {}}, "tools": {}, "delegation": {}}
+        agent.model = "test"
+        agent.session_id = "session"
+        agent.session_manager = Mock()
+        agent.console = Console(file=output, width=100, color_system=None)
+        agent._token_tracker = Mock()
+        agent._token_tracker.estimate.return_value = 1
+        agent._token_tracker.estimate_tools.return_value = 1
+        agent._memory_manager = None
+        agent._snapshot_runtime_state = Mock()
+        agent._reset_runtime_state = Mock()
+        agent._restore_followup_state = Mock()
+        agent._get_messages = Mock(return_value=[{"role": "user", "content": "question"}])
+        agent._upsert_runtime_state_message = Mock()
+        agent._select_tools = Mock(return_value=None)
+        agent._fit_messages = Mock(side_effect=lambda messages, *_: messages)
+        agent._summarize_reply_conclusion = Mock(return_value="")
+        agent._client = Mock()
+        agent._context_window = 4096
+        delta = SimpleNamespace(content="answer", reasoning_content="literal [/dim]", tool_calls=[])
+        agent._client.chat.completions.create.return_value = [
+            SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=delta, finish_reason="stop")]),
+        ]
+
+        self.assertEqual(agent.chat("question"), "answer")
+        self.assertIn("literal [/dim]", output.getvalue())
 
     def test_mcp_stdio_lists_and_calls_tools(self):
         server_code = (

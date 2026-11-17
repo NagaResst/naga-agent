@@ -91,22 +91,29 @@ def execute(args: dict) -> str:
 
     selected = lines[start:end]
     content = "".join(selected)
+    truncated = len(content) > _OUTPUT_MAX_CHARS
+    partial_line = False
+    if truncated:
+        head = content[:_OUTPUT_MAX_CHARS - 200]
+        partial_line = bool(head and not head.endswith("\n"))
+        returned_lines = head.count("\n") + int(partial_line)
+        omitted = max(0, len(selected) - returned_lines)
+        content = f"{head}\n[...后续内容已截断，另有 {omitted} 行未返回，请缩小 start_line/end_line 范围...]"
+    else:
+        returned_lines = len(selected)
 
     header_lines = [
         "[文件读取结果]",
         f"路径：{path}",
         f"类型：{_detect_file_type(path)}",
         f"行范围：{start + 1}-{end} / 共 {total_lines} 行",
+        f"实际返回：{returned_lines} 行"
+        + ("（已截断，末行不完整）" if partial_line else "（已截断）" if truncated else ""),
     ]
     remaining = total_lines - end
     if remaining > 0:
         header_lines.append(f"剩余未读取：{remaining} 行（可调整 end_line 或继续读取）")
     header_lines.append("---")
     header = "\n".join(header_lines) + "\n"
-
-    if len(content) > _OUTPUT_MAX_CHARS:
-        head = content[:_OUTPUT_MAX_CHARS - 200]
-        omitted = content[_OUTPUT_MAX_CHARS - 200:].count("\n")
-        content = f"{head}\n[...后续 {omitted} 行已截断，请缩小 start_line/end_line 范围...]"
 
     return header + content

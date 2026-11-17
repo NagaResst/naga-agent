@@ -31,13 +31,17 @@ DELEGATE_TASKS_DEFINITION = {
 }
 
 
+class _SubtaskCancelled(Exception):
+    pass
+
+
 class SubtaskRunner:
     EXCLUDED_TOOLS = frozenset({"delegate_tasks"})
 
     def __init__(self, client, model: str, tool_definitions: list, tool_executors: dict,
                  record_usage, max_tasks: int = 3, max_rounds: int = 3,
                  context_token_limit: int = 0, base_url: str | None = None,
-                 tool_dispatcher=None):
+                 tool_dispatcher=None, cancelled=None):
         self.client = client
         self.model = model
         self.record_usage = record_usage
@@ -46,6 +50,7 @@ class SubtaskRunner:
         self.context_token_limit = context_token_limit
         self.base_url = base_url
         self.tool_dispatcher = tool_dispatcher
+        self.cancelled = cancelled
         self._token_tracker = TokenTracker()
         self.tool_definitions = [
             {key: value for key, value in definition.items() if key != "tags"}
@@ -65,6 +70,8 @@ class SubtaskRunner:
 
         results = []
         for item in tasks:
+            if self.cancelled and self.cancelled():
+                return "错误：子任务已中断。"
             if not isinstance(item, dict) or not isinstance(item.get("task"), str):
                 return "错误：每个子任务必须包含 task 字符串。"
             task = item["task"].strip()
@@ -74,6 +81,8 @@ class SubtaskRunner:
             try:
                 result = self._run_task(task, context)
                 results.append({"task": task, "status": "ok", "result": result[:4000]})
+            except _SubtaskCancelled:
+                return "错误：子任务已中断。"
             except Exception as exc:
                 results.append({"task": task, "status": "error", "result": str(exc)[:500]})
         return json.dumps({"results": results}, ensure_ascii=False)
@@ -90,6 +99,8 @@ class SubtaskRunner:
         ]
         window = get_context_window(self.model, self.context_token_limit, self.client, self.base_url)
         for round_index in range(self.max_rounds + 1):
+            if self.cancelled and self.cancelled():
+                raise _SubtaskCancelled()
             kwargs = {"model": self.model, "messages": messages, "temperature": 0.2}
             if round_index < self.max_rounds and self.tool_definitions:
                 kwargs["tools"] = self.tool_definitions
@@ -117,6 +128,8 @@ class SubtaskRunner:
             response = self.client.chat.completions.create(**kwargs)
             if response.usage is not None:
                 self.record_usage(self.model, response.usage)
+            if self.cancelled and self.cancelled():
+                raise _SubtaskCancelled()
             message = response.choices[0].message
             if not message.tool_calls:
                 content = (message.content or "").strip()
@@ -133,6 +146,8 @@ class SubtaskRunner:
                 }})
             messages.append({"role": "assistant", "content": message.content, "tool_calls": calls})
             for call in message.tool_calls:
+                if self.cancelled and self.cancelled():
+                    raise _SubtaskCancelled()
                 name = call.function.name
                 executor = self.tool_executors.get(name)
                 try:

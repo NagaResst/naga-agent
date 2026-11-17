@@ -158,6 +158,8 @@ python3 -m pip --use-feature=truststore install truststore
 python3 -c 'import truststore; truststore.inject_into_ssl(); import tiktoken; tiktoken.get_encoding("cl100k_base")'
 ```
 
+状态栏右侧显示 **F2 中断**、**F3 思考折叠/展开**及 **F4 排队/插入**，并显示当前思考和输入模式；终端较窄时会缩写或截断。按 F4 在排队和插入之间切换（默认为排队）。排队消息在当前任务结束后依次作为新任务执行；插入消息以带标记的用户指令加入当前任务，并在下一次模型请求时发送，不会中断正在生成的内容或正在执行的工具。如果当前模型请求已是最终回复，Agent 会再发起一次请求处理插入指令。任务结束或中断时仍未送出的插入指令会转入队列并提示。命令确认不受模式影响。
+
 ---
 
 ## Skill 系统

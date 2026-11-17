@@ -16,15 +16,17 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import ANSI, HTML
+from prompt_toolkit.formatted_text import ANSI, HTML, to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_width
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Dimension, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.utils import get_cwidth
 
 from agent.config import load_config
-from agent.core import Agent, markdown_body
+from agent.core import Agent, InstructionBuffer, markdown_body
 from agent.status import ActivityTracker
 from agent.context_window import get_context_window
 from session.sqlite_session import SessionManager
@@ -32,13 +34,16 @@ from session.sqlite_session import SessionManager
 
 HELP_TEXT = """
 可用内置命令：
+  F2                  中断当前任务（正在执行的同步调用返回后生效）
+  F3                  折叠或展开思考过程
+  F4                  切换排队 / 插入模式
   /quit, /exit        退出程序
   /confirm on         开启自动确认（命令无需手动确认）
   /confirm off        关闭自动确认（命令需手动确认，默认）
   /thinking on        开启思维链模式（需模型在 extra_params 中配置 enable_thinking）
   /thinking off       关闭思维链模式
-  /thinking show      显示思考过程
-  /thinking hide      隐藏思考过程
+  /thinking show      展开思考过程
+  /thinking hide      折叠思考过程
     /model <名称>       切换主模型，例如 /model qwen-plus
     /model auto         恢复配置中的默认主模型
     /delegate on/off    开关低成本子任务分派
@@ -207,6 +212,10 @@ class ChatRunner:
         self._confirmations = queue.Queue()
         self._confirmation_active = False
         self._draft = None
+        self._job_lock = threading.Lock()
+        self._current_cancel = None
+        self._insertions = InstructionBuffer()
+        self._agent._insertions = self._insertions
         self._original_input = console.input
         console.input = self._input
         self._worker = threading.Thread(target=self._run, daemon=True)
@@ -238,6 +247,31 @@ class ChatRunner:
         self._jobs.put((text, session_id, rename))
         self._prompt_session.app.invalidate()
 
+    def insert(self, text: str, session_id: str) -> bool:
+        with self._job_lock:
+            if (self._current_cancel is not None and not self._current_cancel.is_set()
+                    and self._insertions.insert(text)):
+                return True
+            self._jobs.put((text, session_id, False))
+        self._prompt_session.app.invalidate()
+        return False
+
+    def cancel_current(self) -> bool:
+        with self._job_lock:
+            if self._current_cancel is None:
+                return False
+            self._current_cancel.set()
+            try:
+                reply = self._confirmations.get_nowait()
+            except queue.Empty:
+                reply = None
+            self._confirmation_active = False
+            if reply is not None:
+                reply.put("n")
+            self._agent.cancel_active_stream()
+        self._prompt_session.app.invalidate()
+        return True
+
     def close(self):
         self._jobs.put(None)
         self._worker.join()
@@ -261,7 +295,10 @@ class ChatRunner:
         if threading.current_thread() is not self._worker:
             return self._original_input(prompt, *args, **kwargs)
         reply = queue.Queue(maxsize=1)
-        self._confirmations.put(reply)
+        with self._job_lock:
+            if self._current_cancel is not None and self._current_cancel.is_set():
+                return "n"
+            self._confirmations.put(reply)
         loop = self._prompt_session.app.loop
         if loop is not None:
             loop.call_soon_threadsafe(self.activate_confirmation)
@@ -275,6 +312,11 @@ class ChatRunner:
                 self._jobs.task_done()
                 return
             text, session_id, rename = job
+            cancel_event = threading.Event()
+            with self._job_lock:
+                self._current_cancel = cancel_event
+                self._agent._cancel_event = cancel_event
+                self._insertions.open()
             try:
                 started = time.monotonic()
                 _show_dialogue_header(self._console, "assistant", datetime.now())
@@ -287,71 +329,211 @@ class ChatRunner:
                         daemon=True,
                     ).start()
             except Exception as exc:
-                self._console.print(f"[bold red]错误：{exc}[/bold red]")
+                self._console.print(f"错误：{exc}", style="bold red", markup=False, highlight=False)
             finally:
+                with self._job_lock:
+                    pending = self._insertions.close()
+                    for instruction in pending:
+                        self._jobs.put((instruction, session_id, False))
+                    self._current_cancel = None
+                if pending:
+                    self._console.print(
+                        f"当前任务已结束或中断，{len(pending)} 条未发送的插入指令已转入队列。",
+                        style="yellow",
+                    )
                 self._agent.activity.set("idle")
                 self._jobs.task_done()
                 self._prompt_session.app.invalidate()
 
 
-def _paint_status_line(output, frame, status_text):
+def _truncate_fragments(fragments, width):
+    result = []
+    remaining = max(0, width)
+    for style, text, *extra in fragments:
+        chars = []
+        for char in text:
+            char_width = get_cwidth(char)
+            if char_width > remaining:
+                return result + ([(style, "".join(chars), *extra)] if chars else [])
+            chars.append(char)
+            remaining -= char_width
+        if chars:
+            result.append((style, "".join(chars), *extra))
+    return result
+
+
+def _status_shortcuts(input_mode, thinking_expanded, width):
+    mode = "插入" if input_mode == "insert" else "排队"
+    thinking = "展开" if thinking_expanded else "折叠"
+    full = f"F2 中断  F3 思考:{thinking}  F4 {mode} "
+    compact = f"F2中断 F3{thinking} F4{mode}"
+    if get_cwidth(full) <= width:
+        return full
+    if get_cwidth(compact) <= width:
+        return compact
+    return f"F2停 F3{thinking[0]} F4{mode[0]}"
+
+
+def _format_status_toolbar(left, shortcuts, width):
+    width = max(0, width)
+    right = _truncate_fragments([("", shortcuts)], width)
+    right_width = fragment_list_width(right)
+    left = to_formatted_text(left)
+    left_limit = max(0, width - right_width - 1)
+    if fragment_list_width(left) > left_limit:
+        left = _truncate_fragments(left, max(0, left_limit - 1))
+        if left_limit:
+            left.append(("", "…"))
+    padding = max(0, width - fragment_list_width(left) - right_width)
+    return left + [("", " " * padding)] + right
+
+
+def _paint_status_line(output, frame, status_text, max_width=None):
     """流式输出期间直画状态行（保底路径，与 bottom_toolbar 内容一致）。"""
+    fragments = [("", f"{frame} {status_text}")]
+    if max_width is not None:
+        fragments = _truncate_fragments(fragments, max_width)
+    text = "".join(fragment[1] for fragment in fragments)
+    if not text:
+        return
     output.write_raw("\x1b7")
     output.cursor_goto(output.get_size().rows, 2)
-    output.write_raw(f"\x1b[0;32;7m{frame} {status_text}\x1b8")
+    output.write_raw(f"\x1b[0;32;7m{text}\x1b8")
     output.flush()
+
+
+class _OutputBuffer:
+    def __init__(self):
+        self.chunks = []
+        self.ends = []
+
+    def __len__(self):
+        return self.ends[-1] if self.ends else 0
+
+    def append(self, text):
+        if text:
+            self.chunks.append(text)
+            self.ends.append(len(self) + len(text))
+
+    def slice(self, start, end):
+        if start >= end:
+            return ""
+        index = bisect.bisect_right(self.ends, start)
+        position = self.ends[index - 1] if index else 0
+        parts = []
+        while position < end and index < len(self.chunks):
+            chunk = self.chunks[index]
+            parts.append(chunk[max(0, start - position):end - position])
+            position = self.ends[index]
+            index += 1
+        return "".join(parts)
+
+    def truncate(self, end):
+        if end >= len(self):
+            return
+        index = bisect.bisect_right(self.ends, end)
+        position = self.ends[index - 1] if index else 0
+        remainder = self.chunks[index][:end - position]
+        del self.chunks[index:]
+        del self.ends[index:]
+        self.append(remainder)
+
+    def prepend(self, text):
+        if text:
+            self.chunks.insert(0, text)
+            self.ends = [len(text)] + [end + len(text) for end in self.ends]
+
+
+class _AnsiStyleState:
+    def __init__(self):
+        self.attributes = {}
+
+    def update(self, sequence):
+        parameters = sequence[2:-1] if sequence.startswith("\x1b[") else sequence[1:-1]
+        codes = [min(int(part or 0), 9999) for part in parameters.split(";")]
+        index = 0
+        while index < len(codes):
+            code = codes[index]
+            index += 1
+            if code == 0:
+                self.attributes.clear()
+            elif code in (38, 48) and index < len(codes):
+                mode = codes[index]
+                count = 2 if mode == 5 else 4 if mode == 2 else 1
+                if mode in (2, 5) and len(codes) - index >= count:
+                    self.attributes["fg" if code == 38 else "bg"] = [code] + codes[index:index + count]
+                index += min(count, len(codes) - index)
+            elif 30 <= code <= 37 or 90 <= code <= 97 or code == 39:
+                self.attributes["fg"] = [code]
+            elif 40 <= code <= 47 or 100 <= code <= 107 or code == 49:
+                self.attributes["bg"] = [code]
+            elif code in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+                key = 5 if code == 6 else code
+                self.attributes[key] = [code]
+            elif code == 22:
+                self.attributes.pop(1, None)
+                self.attributes.pop(2, None)
+            elif code in (23, 24, 25, 27, 28, 29):
+                self.attributes.pop(code - 20, None)
+
+    def prefix(self):
+        codes = [str(code) for value in self.attributes.values() for code in value]
+        return "\x1b[" + ";".join(codes) + "m" if codes else ""
 
 
 class OutputPane:
     _VISIBLE_LINES = 200
     _SGR_PATTERN = re.compile(r"(?:\x1b\[|\x9b)[0-9;]*m")
     _NEWLINE_PATTERN = re.compile("\n")
+    _FOLDED_REASONING = "\x1b[2m[思考过程已折叠，F3 展开]\x1b[0m"
 
-    def __init__(self, app):
+    def __init__(self, app, show_thinking=True):
         self._app = app
-        self._text = ""
+        self._buffer = _OutputBuffer()
         self._lock = threading.Lock()
         self._scrollback = 0
         self._rendered_line = 0
         self._response_owner = None
         self._response_spans = []
+        self._reasoning_segments = []
+        self._active_reasoning = None
+        self._show_thinking = show_thinking
         self._formatted_cache = None
         self._line_starts = [0]
         self._style_offset = 0
-        self._style_prefix = ""
+        self._style_state = _AnsiStyleState()
 
     def _index_from(self, start):
         del self._line_starts[bisect.bisect_right(self._line_starts, start):]
         self._line_starts.extend(
-            match.end() for match in self._NEWLINE_PATTERN.finditer(self._text, start)
+            start + match.end() for match in self._NEWLINE_PATTERN.finditer(
+                self._buffer.slice(start, len(self._buffer))
+            )
         )
         if start < self._style_offset:
             self._style_offset = 0
-            self._style_prefix = ""
+            self._style_state = _AnsiStyleState()
 
     def _prefix_at(self, start):
         if start < self._style_offset:
             self._style_offset = 0
-            self._style_prefix = ""
-        for match in self._SGR_PATTERN.finditer(self._text, self._style_offset, start):
-            sequence = match.group()
-            if sequence in ("\x1b[m", "\x1b[0m", "\x9bm", "\x9b0m"):
-                self._style_prefix = ""
-            else:
-                self._style_prefix += sequence
+            self._style_state = _AnsiStyleState()
+        for match in self._SGR_PATTERN.finditer(self._buffer.slice(self._style_offset, start)):
+            self._style_state.update(match.group())
         self._style_offset = start
-        return self._style_prefix
+        return self._style_state.prefix()
 
     def write(self, text):
         with self._lock:
-            start = len(self._text)
+            start = len(self._buffer)
+            old_lines = self._line_count()
             if self._response_owner is threading.current_thread() and text:
                 self._response_spans.append((start, start + len(text)))
-            self._text += text
+            self._buffer.append(text)
             self._index_from(start)
             self._formatted_cache = None
             if self._scrollback:
-                self._scrollback += text.count("\n")
+                self._scrollback += self._line_count() - old_lines
         self._app.invalidate()
         return len(text)
 
@@ -359,17 +541,86 @@ class OutputPane:
         if not text:
             return
         with self._lock:
-            self._text = text + self._text
+            self._buffer.prepend(text)
             self._response_spans = [(start + len(text), end + len(text)) for start, end in self._response_spans]
+            for segment in self._reasoning_segments:
+                segment["start"] += len(text)
+                segment["end"] += len(text)
             self._line_starts = [0]
             self._style_offset = 0
-            self._style_prefix = ""
+            self._style_state = _AnsiStyleState()
             self._index_from(0)
             self._formatted_cache = None
         self._app.invalidate()
 
     def flush(self):
         pass
+
+    def start_reasoning(self):
+        with self._lock:
+            self._active_reasoning = None
+
+    def write_reasoning(self, text):
+        if not text:
+            return
+        with self._lock:
+            segment = self._active_reasoning
+            start = len(self._buffer)
+            if segment is None or segment["end"] != start:
+                segment = {"start": start, "end": start, "parts": []}
+                self._reasoning_segments.append(segment)
+                self._active_reasoning = segment
+                displayed = text if self._show_thinking else self._FOLDED_REASONING
+            else:
+                displayed = text if self._show_thinking else ""
+            segment["parts"].append(text)
+            if displayed:
+                old_lines = self._line_count()
+                self._buffer.append(displayed)
+                segment["end"] += len(displayed)
+                self._index_from(start)
+                self._formatted_cache = None
+                if self._scrollback:
+                    self._scrollback += self._line_count() - old_lines
+        if displayed:
+            self._app.invalidate()
+
+    def end_reasoning(self):
+        with self._lock:
+            self._active_reasoning = None
+
+    def _splice(self, start, end, text, target=None):
+        tail = self._buffer.slice(end, len(self._buffer))
+        old = self._buffer.slice(start, end)
+        self._buffer.truncate(start)
+        self._buffer.append(text)
+        self._buffer.append(tail)
+        shift = len(text) - (end - start)
+        self._response_spans = [
+            (first + shift, last + shift) if first >= end else (first, last)
+            for first, last in self._response_spans
+        ]
+        for segment in self._reasoning_segments:
+            if segment is target:
+                segment["end"] = start + len(text)
+            elif segment["start"] >= end:
+                segment["start"] += shift
+                segment["end"] += shift
+        if self._scrollback:
+            self._scrollback = max(0, self._scrollback + text.count("\n") - old.count("\n"))
+
+    def set_thinking_expanded(self, expanded):
+        with self._lock:
+            if expanded == self._show_thinking:
+                return
+            self._show_thinking = expanded
+            for segment in reversed(self._reasoning_segments):
+                text = "".join(segment["parts"]) if expanded else self._FOLDED_REASONING
+                self._splice(segment["start"], segment["end"], text, target=segment)
+            if self._reasoning_segments:
+                self._index_from(self._reasoning_segments[0]["start"])
+                self._formatted_cache = None
+        self._app.invalidate()
 
     def start_response(self):
         with self._lock:
@@ -389,18 +640,12 @@ class OutputPane:
                     self._response_owner = None
                 return
             start = self._response_spans[0][0]
-            previous = "".join(self._text[first:last] for first, last in self._response_spans)
-            parts = [self._text[:start], rendered]
-            end = self._response_spans[0][1]
-            for first, last in self._response_spans[1:]:
-                parts.append(self._text[end:first])
-                end = last
-            parts.append(self._text[end:])
-            self._text = "".join(parts)
+            spans = self._response_spans[:]
+            for first, last in reversed(spans[1:]):
+                self._splice(first, last, "")
+            self._splice(start, spans[0][1], rendered)
             self._index_from(start)
             self._formatted_cache = None
-            if self._scrollback:
-                self._scrollback = max(0, self._scrollback + rendered.count("\n") - previous.count("\n"))
             self._response_owner = None if final else threading.current_thread()
             self._response_spans = [] if final else [(start, start + len(rendered))]
         self._app.invalidate()
@@ -408,16 +653,24 @@ class OutputPane:
     def isatty(self):
         return True
 
+    def _line_count(self):
+        end = len(self._buffer)
+        return len(self._line_starts) - int(self._buffer.slice(end - 1, end) == "\n")
+
+    @property
+    def _text(self):
+        return self._buffer.slice(0, len(self._buffer))
+
     def formatted_text(self):
         with self._lock:
             if self._formatted_cache is None:
-                end = len(self._text)
+                end = len(self._buffer)
                 if self._scrollback:
-                    line_count = len(self._line_starts) - int(self._text.endswith("\n"))
+                    line_count = self._line_count()
                     end = self._line_starts[line_count - self._scrollback]
                 end_line = bisect.bisect_left(self._line_starts, end)
                 start = self._line_starts[max(0, end_line - self._VISIBLE_LINES)]
-                text = self._prefix_at(start) + self._text[start:end]
+                text = self._prefix_at(start) + self._buffer.slice(start, end)
                 self._rendered_line = text.count("\n")
                 self._formatted_cache = ANSI(text)
             return self._formatted_cache
@@ -428,7 +681,7 @@ class OutputPane:
 
     def scroll(self, lines):
         with self._lock:
-            line_count = len(self._line_starts) - int(self._text.endswith("\n"))
+            line_count = self._line_count()
             max_scroll = max(0, line_count - 1)
             requested = self._scrollback + lines
             self._scrollback = max(0, min(requested, max_scroll))
@@ -439,15 +692,17 @@ class OutputPane:
 
     def clear(self):
         with self._lock:
-            self._text = ""
+            self._buffer = _OutputBuffer()
             self._scrollback = 0
             self._rendered_line = 0
             self._response_owner = None
             self._response_spans = []
+            self._reasoning_segments = []
+            self._active_reasoning = None
             self._formatted_cache = None
             self._line_starts = [0]
             self._style_offset = 0
-            self._style_prefix = ""
+            self._style_state = _AnsiStyleState()
         self._app.invalidate()
 
 
@@ -487,6 +742,7 @@ def main():
         return str(value)
 
     frames = "◐◓◑◒"
+    input_mode = "queue"
 
     def _context_toolbar():
         """底部固定状态栏：显示当前阶段 + 最近一次请求的输入用量。"""
@@ -509,26 +765,32 @@ def main():
             activity += background_text
             context = getattr(agent, "_context_metrics", {})
             if context.get("model") != agent.model or "prompt_estimate" not in context:
-                return HTML(f" {activity}  <b>模型:</b> {agent.model}  <b>最近请求:</b> 尚未计算 ")
-            used = context["prompt_estimate"]
-            max_ctx = context["window"]
-            pct = used / max_ctx * 100 if max_ctx > 0 else 0
-            if pct < 60:
-                color = "ansigreen"
-            elif pct < 80:
-                color = "ansiyellow"
+                left = HTML(f" {activity}  <b>模型:</b> {agent.model}  <b>最近请求:</b> 尚未计算 ")
             else:
-                color = "ansired"
-            max_k = _format_token_limit(max_ctx)
-            return HTML(
-                f" {activity}  <b>模型:</b> {agent.model}  "
-                f"<b>最近请求:</b> <{color}>{used:,} / {max_k} ({pct:.1f}%)</{color}> "
+                used = context["prompt_estimate"]
+                max_ctx = context["window"]
+                pct = used / max_ctx * 100 if max_ctx > 0 else 0
+                if pct < 60:
+                    color = "ansigreen"
+                elif pct < 80:
+                    color = "ansiyellow"
+                else:
+                    color = "ansired"
+                max_k = _format_token_limit(max_ctx)
+                left = HTML(
+                    f" {activity}  <b>模型:</b> {agent.model}  "
+                    f"<b>最近请求:</b> <{color}>{used:,} / {max_k} ({pct:.1f}%)</{color}> "
+                )
+            width = prompt_session.app.output.get_size().columns
+            shortcuts = _status_shortcuts(
+                input_mode, agent.config["agent"].get("show_thinking", True), width
             )
+            return _format_status_toolbar(left, shortcuts, width)
         except Exception:
             return ""
 
     prompt_session = PromptSession(erase_when_done=True)
-    output_pane = OutputPane(prompt_session.app)
+    output_pane = OutputPane(prompt_session.app, show_thinking=agent.config["agent"].get("show_thinking", True))
     layout = prompt_session.app.layout
     output_window = Window(
         FormattedTextControl(output_pane.formatted_text, get_cursor_position=output_pane.cursor_position),
@@ -573,6 +835,33 @@ def main():
         page = output_window.render_info.window_height if output_window.render_info else 10
         _scroll_output(-page)
 
+    @bindings.add("f2")
+    def _cancel_task(event):
+        if chat_runner.cancel_current():
+            draft = chat_runner.take_draft()
+            if draft:
+                event.app.current_buffer.set_document(draft)
+            console.print(
+                "已请求中断；模型流输出将停止，阻塞工具或远程操作可能仍在运行且可能产生费用。",
+                style="yellow",
+            )
+        else:
+            console.print("当前没有可中断的任务。", style="dim")
+
+    @bindings.add("f3")
+    def _toggle_thinking(event):
+        enabled = not agent.config["agent"].get("show_thinking", True)
+        agent.config["agent"]["show_thinking"] = enabled
+        output_pane.set_thinking_expanded(enabled)
+        event.app.invalidate()
+
+    @bindings.add("f4")
+    def _toggle_input_mode(event):
+        nonlocal input_mode
+        input_mode = "insert" if input_mode == "queue" else "queue"
+        console.print(f"输入模式：{'插入' if input_mode == 'insert' else '排队'}。", style="green")
+        event.app.invalidate()
+
     prompt_session.key_bindings = bindings
     original_console_file = console.file
     console.file = output_pane
@@ -596,7 +885,12 @@ def main():
             if background:
                 status += f"  ⟳{ActivityTracker.LABELS.get(background, background)}"
             output = prompt_session.app.output
-            _paint_status_line(output, frames[int(time.monotonic() * 4) % len(frames)], status)
+            width = output.get_size().columns
+            shortcuts = _status_shortcuts(
+                input_mode, agent.config["agent"].get("show_thinking", True), width
+            )
+            max_width = max(0, width - get_cwidth(shortcuts) - 2)
+            _paint_status_line(output, frames[int(time.monotonic() * 4) % len(frames)], status, max_width)
             # busy 时阶段/秒数会变化，需周期性刷新工具栏；空闲时无需重绘
             prompt_session.app.invalidate()
 
@@ -633,8 +927,14 @@ def main():
                 console.print("[yellow]正在回复，请等待完成后再执行命令。[/yellow]")
             else:
                 _show_dialogue_message(console, "user", user_input, datetime.now())
-                chat_runner.submit(user_input, agent.session_id)
-                console.print("[dim]消息已排队，当前回复完成后发送。[/dim]")
+                if input_mode == "insert":
+                    if chat_runner.insert(user_input, agent.session_id):
+                        console.print("[dim]指令已插入，将在下一次模型请求时发送。[/dim]")
+                    else:
+                        console.print("[dim]当前没有可插入的任务，消息已转入队列。[/dim]")
+                else:
+                    chat_runner.submit(user_input, agent.session_id)
+                    console.print("[dim]消息已排队，当前回复完成后发送。[/dim]")
             continue
 
         if user_input in ("/quit", "/exit"):
@@ -670,11 +970,11 @@ def main():
 
         elif user_input == "/thinking show":
             agent.config["agent"]["show_thinking"] = True
-            console.print("[green]思考过程显示已开启[/green]")
+            output_pane.set_thinking_expanded(True)
 
         elif user_input == "/thinking hide":
             agent.config["agent"]["show_thinking"] = False
-            console.print("[green]思考过程显示已关闭[/green]")
+            output_pane.set_thinking_expanded(False)
 
         elif user_input.startswith("/model "):
             new_model = user_input[7:].strip()
