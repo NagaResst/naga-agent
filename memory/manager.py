@@ -58,7 +58,7 @@ class MemoryManager:
       - 自动提取(每 N 轮) + 手动保存 + 语义检索 + 按 ID 删除
     """
 
-    def __init__(self, memory_cfg: dict, api_key: str = "", base_url: str | None = None, storage=None):
+    def __init__(self, memory_cfg: dict, api_key: str = "", base_url: str | None = None, storage=None, activity=None):
         self._cfg = memory_cfg
         self._storage = storage
         self._api_key = api_key
@@ -66,6 +66,7 @@ class MemoryManager:
         self._core_cache: dict[str, dict] = {}
         self._mem0 = None
         self._turn_count = 0
+        self._activity = activity
 
         # mem0 初始化
         try:
@@ -165,6 +166,8 @@ class MemoryManager:
         if not self.available or not query.strip():
             return []
         try:
+            if self._activity is not None:
+                self._activity.set("memory_search", query[:30])
             results = self._mem0.search(
                 query, filters={"agent_id": self._cfg.get("agent_id", "naga-agent")}, top_k=top_k,
             )
@@ -189,6 +192,9 @@ class MemoryManager:
         cfg = self._cfg.get("reranker", {})
         if len(candidates) < 2 or not cfg.get("model") or not cfg.get("base_url"):
             return candidates
+        activity = getattr(self, "_activity", None)
+        if activity is not None:
+            activity.set("memory_rerank", f"{len(candidates)}条")
         try:
             response = requests.post(
                 urljoin(cfg["base_url"].rstrip("/") + "/", "rerank"),
@@ -278,10 +284,23 @@ class MemoryManager:
         return self._turn_count > 0 and self._turn_count % every_n == 0
 
     def extract_async(self, messages: list):
-        if not self.available:
+        if not getattr(self, "available", False):
             return
+        activity = getattr(self, "_activity", None)
+
+        def _run(*args, **kwargs):
+            if activity is not None:
+                activity.set_background("extract")
+            try:
+                self._mem0.add(*args, **kwargs)
+            except Exception as exc:
+                print(f"[MemoryManager] 后台记忆提取失败：{exc}")
+            finally:
+                if activity is not None:
+                    activity.clear_background()
+
         t = threading.Thread(
-            target=self._mem0.add,
+            target=_run,
             args=(messages,),
             kwargs={"agent_id": self._cfg.get("agent_id", "naga-agent"),
                     "metadata": {"layer": "episodic", "source": "auto_extract"}},

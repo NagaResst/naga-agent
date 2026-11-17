@@ -75,20 +75,19 @@ class SessionManager:
     def list_sessions(self) -> list:
         conn = self._conn()
         rows = conn.execute(
-            "SELECT id, name, created_at FROM sessions ORDER BY created_at DESC"
+            "SELECT s.id, s.name, s.created_at, COUNT(m.id) AS message_count "
+            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+            "GROUP BY s.id ORDER BY s.created_at DESC"
         ).fetchall()
-        result = []
-        for row in rows:
-            msg_count = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (row["id"],)
-            ).fetchone()[0]
-            result.append({
+        return [
+            {
                 "id": row["id"],
                 "name": row["name"],
                 "created_at": row["created_at"],
-                "message_count": msg_count,
-            })
-        return result
+                "message_count": row["message_count"],
+            }
+            for row in rows
+        ]
 
     def create_session(self, name: str) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -133,6 +132,35 @@ class SessionManager:
                 except Exception:
                     pass
             result.append(msg)
+        return result
+
+    def get_history_before(self, session_id: str, before_id: int | None = None, limit: int = 40) -> list[dict]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        query = (
+            "SELECT id, role, content, metadata, timestamp FROM messages "
+            "WHERE session_id = ?"
+        )
+        params: list[str | int] = [session_id]
+        if before_id is not None:
+            query += " AND id < ?"
+            params.append(before_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn().execute(query, params).fetchall()
+        result = []
+        for row in reversed(rows):
+            message = {"id": row["id"], "role": row["role"], "content": row["content"],
+                       "timestamp": row["timestamp"]}
+            if row["metadata"]:
+                try:
+                    metadata = json.loads(row["metadata"])
+                    if isinstance(metadata, dict):
+                        message.update(metadata)
+                except (ValueError, TypeError):
+                    pass
+            message["id"] = row["id"]
+            result.append(message)
         return result
 
     def get_history_since(self, session_id: str, after_id: int = 0) -> list[dict]:

@@ -11,6 +11,7 @@ from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 
 from agent.core import Agent
+from agent.status import ActivityTracker
 from agent.skill_registry import discover_skills
 from agent.subagent import SubtaskRunner
 from agent.token_tracker import TokenTracker
@@ -42,7 +43,7 @@ class SubtaskRunnerTests(unittest.TestCase):
         self.assertEqual(sent[-2]["tool_calls"][0]["id"], sent[-1]["tool_call_id"])
         self.assertLess(len(sent[-1]["content"]), len(original))
 
-    def test_isolated_tasks_use_child_model_and_read_only_tools(self):
+    def test_isolated_tasks_use_child_model_and_all_registered_tools(self):
         client = Mock()
         client.chat.completions.create.side_effect = [
             response(calls=[tool_call("read_file")], usage={"prompt_tokens": 2, "completion_tokens": 1}),
@@ -51,14 +52,17 @@ class SubtaskRunnerTests(unittest.TestCase):
         ]
         read_file = Mock(return_value="source text")
         execute_command = Mock()
+        tool_dispatcher = Mock(return_value="source text")
         record_usage = Mock()
         definitions = [
             {"type": "function", "function": {"name": name}}
-            for name in ("read_file", "execute_command", "delegate_tasks")
+            for name in ("read_file", "execute_command", "memory", "skill_manager", "mcp", "delegate_tasks")
         ]
         runner = SubtaskRunner(
             client, "cheap-model", definitions,
-            {"read_file": read_file, "execute_command": execute_command}, record_usage,
+            {"read_file": read_file, "execute_command": execute_command, "memory": Mock(),
+             "skill_manager": Mock(), "mcp": Mock(), "delegate_tasks": Mock()},
+            record_usage, tool_dispatcher=tool_dispatcher,
         )
 
         result = json.loads(runner.execute({"tasks": [{"task": "first"}, {"task": "second"}]}))
@@ -67,26 +71,38 @@ class SubtaskRunnerTests(unittest.TestCase):
         self.assertEqual(client.chat.completions.create.call_count, 3)
         requests = client.chat.completions.create.call_args_list
         self.assertTrue(all(call.kwargs["model"] == "cheap-model" for call in requests))
-        self.assertEqual([item["function"]["name"] for item in requests[0].kwargs["tools"]], ["read_file"])
+        self.assertEqual(
+            [item["function"]["name"] for item in requests[0].kwargs["tools"]],
+            ["read_file", "execute_command", "memory", "skill_manager", "mcp"],
+        )
         self.assertEqual(len(requests[2].kwargs["messages"]), 2)
         self.assertEqual(requests[1].kwargs["messages"][-1]["content"], "source text")
-        read_file.assert_called_once_with({})
+        tool_dispatcher.assert_called_once_with("read_file", {})
+        read_file.assert_not_called()
         execute_command.assert_not_called()
         record_usage.assert_called_once_with("cheap-model", {"prompt_tokens": 2, "completion_tokens": 1})
 
-    def test_rejects_recursive_or_unsafe_calls_and_respects_limits(self):
+    def test_rejects_recursive_calls_and_respects_limits(self):
         client = Mock()
         client.chat.completions.create.side_effect = [
-            response(calls=[tool_call("execute_command")]), response("cannot run commands"),
+            response(calls=[tool_call("delegate_tasks")]), response("cannot delegate recursively"),
         ]
-        execute_command = Mock()
-        runner = SubtaskRunner(client, "cheap", [], {"execute_command": execute_command}, Mock(), max_tasks=1)
+        delegate_tasks = Mock()
+        runner = SubtaskRunner(
+            client, "cheap",
+            [{"type": "function", "function": {"name": "delegate_tasks"}}],
+            {"delegate_tasks": delegate_tasks}, Mock(), max_tasks=1,
+        )
 
         self.assertTrue(runner.execute({"tasks": [{"task": "one"}, {"task": "two"}]}).startswith("错误："))
         result = json.loads(runner.execute({"tasks": [{"task": "one"}]}))
         self.assertEqual(result["results"][0]["status"], "ok")
-        self.assertIn("不允许调用", client.chat.completions.create.call_args_list[1].kwargs["messages"][-1]["content"])
-        execute_command.assert_not_called()
+        self.assertNotIn("tools", client.chat.completions.create.call_args_list[1].kwargs)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[1].kwargs["messages"][-1]["content"],
+            "错误：子 Agent 不允许调用 delegate_tasks",
+        )
+        delegate_tasks.assert_not_called()
 
     def test_child_error_does_not_cancel_other_tasks(self):
         client = Mock()
@@ -126,6 +142,7 @@ class MainAgentDelegationTests(unittest.TestCase):
                 manager.append_message(session_id, "assistant", f"answer {number}")
             manager.append_message(session_id, "user", "latest")
             agent = Agent.__new__(Agent)
+            agent.activity = ActivityTracker()
             agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 3000,
                                       "tool_result_keep_rounds": 1}, "delegation": {}}
             agent.model = "main"
@@ -154,6 +171,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_old_tool_batches_are_pruned_without_orphaned_replies(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"agent": {"tool_result_keep_rounds": 2}}
         agent.max_history = 100
         agent._token_tracker = Mock()
@@ -180,6 +198,39 @@ class MainAgentDelegationTests(unittest.TestCase):
                           and not message.get("tool_calls")], [f"answer {number}" for number in range(4)])
         self.assertEqual(len([message for message in messages if message["role"] == "tool"]), 4)
 
+    def test_all_tool_results_from_current_turn_are_preserved(self):
+        agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
+        agent.config = {"agent": {"tool_result_keep_rounds": 2}}
+        agent.max_history = 100
+        agent._token_tracker = Mock()
+        agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(item)) for item in messages)
+        agent._token_tracker.estimate_tools.return_value = 0
+        messages = [{"role": "system", "content": "rules"}]
+        for number in range(5):
+            messages.extend([
+                {"role": "user", "content": f"old request {number}"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": f"old-call-{number}", "function": {"name": "read_file"}},
+                ]},
+                {"role": "tool", "tool_call_id": f"old-call-{number}", "content": f"old result {number}"},
+            ])
+        messages.append({"role": "user", "content": "current request"})
+        for number in range(5):
+            messages.extend([
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": f"current-call-{number}", "function": {"name": "read_file"}},
+                ]},
+                {"role": "tool", "tool_call_id": f"current-call-{number}", "content": f"current result {number}"},
+            ])
+
+        fitted = agent._fit_messages(messages, 10000, None)
+
+        results = [message["content"] for message in fitted if message["role"] == "tool"]
+        self.assertEqual(results, [
+            "current result 0", "current result 1", "current result 2", "current result 3", "current result 4",
+        ])
+
     def test_assembled_context_restores_summary_after_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "context.db")
@@ -191,6 +242,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
             def assemble(store):
                 agent = Agent.__new__(Agent)
+                agent.activity = ActivityTracker()
                 agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 2000}, "delegation": {}}
                 agent.model = "main"
                 agent.session_id = session_id
@@ -226,6 +278,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_summary_survives_history_trimming(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent._token_tracker = Mock()
         agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(item)) for item in messages)
         agent._token_tracker.estimate_tools.return_value = 0
@@ -258,6 +311,7 @@ class MainAgentDelegationTests(unittest.TestCase):
             manager.append_message(session_id, "user", "current request")
             original = manager.get_history_since(session_id)
             agent = Agent.__new__(Agent)
+            agent.activity = ActivityTracker()
             agent.config = {"agent": {"context_compact_ratio": 0.75}}
             agent.session_manager = manager
             agent.session_id = session_id
@@ -280,6 +334,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_compression_keeps_unfinished_tool_turn(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"agent": {"context_compact_ratio": 0.75}}
         agent.session_manager = Mock()
         agent.session_id = "test"
@@ -306,6 +361,7 @@ class MainAgentDelegationTests(unittest.TestCase):
             session_id = manager.create_session("cache")
             manager.append_message(session_id, "user", "first")
             agent = Agent.__new__(Agent)
+            agent.activity = ActivityTracker()
             agent.session_manager = manager
             agent.session_id = session_id
             manager.get_history_since = Mock(wraps=manager.get_history_since)
@@ -320,6 +376,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_skill_match_uses_frontmatter_and_forced_selection(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"skills": {"min_match_score": 2.2, "match_top_k": 1}}
         agent._session_theme = ""
         agent._skills = [
@@ -344,6 +401,7 @@ class MainAgentDelegationTests(unittest.TestCase):
             (Path(directory) / "disabled.md").write_text(disabled_frontmatter + "not active\n", encoding="utf-8")
 
             agent = Agent.__new__(Agent)
+            agent.activity = ActivityTracker()
             agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 10000}, "delegation": {}}
             agent.model = "main"
             agent.session_id = "test"
@@ -378,6 +436,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_oversized_explicit_skill_fails_without_truncating(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"agent": {}}
         agent.max_history = 10
         agent._token_tracker = Mock()
@@ -394,6 +453,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_runtime_state_refresh_preserves_stable_system_prefix(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent._token_tracker = Mock()
         agent._build_runtime_state_block = Mock(side_effect=[
             "【固定约束与运行状态】first", "【固定约束与运行状态】second",
@@ -422,6 +482,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_memory_uses_remaining_budget_after_tools_and_skills(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 2048}, "delegation": {}}
         agent.model = "main"
         agent.session_id = "test"
@@ -460,6 +521,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_long_skill_uses_space_before_memory(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"agent": {"system_prompt": "rules", "context_token_limit": 1100}, "delegation": {}}
         agent.model = "main"
         agent.session_id = "test"
@@ -489,6 +551,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_tool_schema_cache_invalidates_when_delegation_changes(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"delegation": {"enabled": False}}
         agent.tool_definitions = [{"type": "function", "function": {"name": "read_file"}, "tags": ["local"]}]
         agent._subtask_runner = Mock()
@@ -523,6 +586,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def _loop_agent(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {
             "agent": {"show_thinking": False, "context_token_limit": 4096}, "model": {"extra_params": {}},
             "delegation": {"enabled": True, "max_calls": 2}, "tools": {"tool_max_rounds": 2},
@@ -590,7 +654,10 @@ class MainAgentDelegationTests(unittest.TestCase):
             self.assertIn("queued user message", pane._text)
 
         agent._client.chat.completions.create.return_value = stream()
-        with patch("agent.core.time.monotonic", side_effect=[1.0, 1.0, 1.3, 1.3]):
+        # chat 流程含 activity.set 的额外 time.monotonic 调用（prepare/llm_wait/llm_stream/idle），
+        # 用生成器按需供值：前半 1.0，后半 1.3，避免固定列表耗尽
+        clock = iter([1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.3, 1.3, 1.3, 1.3, 1.3, 1.3])
+        with patch("agent.core.time.monotonic", side_effect=lambda: next(clock)):
             self.assertEqual(agent.chat("question"), answer)
         displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
         self.assertIn("tool log", displayed)
@@ -661,6 +728,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_budget_rejects_oversized_latest_user(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.max_history = 10
         agent._token_tracker = Mock()
         agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(message)) for message in messages)
@@ -670,6 +738,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_context_budget_keeps_complete_recent_turns(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.max_history = 10
         agent._token_tracker = Mock()
         agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(message)) for message in messages)
@@ -689,6 +758,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_context_budget_truncates_tool_output_without_mutating_original(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.max_history = 10
         agent._token_tracker = Mock()
         agent._token_tracker.estimate.side_effect = lambda messages: sum(len(str(message)) for message in messages)
@@ -732,6 +802,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_delegation_not_exposed_without_child_model(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"delegation": {"enabled": True}}
         agent.tool_definitions = []
         agent.tool_executors = {}
@@ -742,6 +813,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_main_turn_stops_delegating_at_budget(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {"delegation": {"enabled": True, "max_calls": 1}}
         agent._delegation_calls = 0
         agent._subtask_runner = Mock()
@@ -753,6 +825,7 @@ class MainAgentDelegationTests(unittest.TestCase):
 
     def test_main_prompt_explains_delegation_without_preclassification(self):
         agent = Agent.__new__(Agent)
+        agent.activity = ActivityTracker()
         agent.config = {
             "agent": {"system_prompt": "main", "context_token_limit": 200000},
             "delegation": {"enabled": True},

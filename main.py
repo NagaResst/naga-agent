@@ -1,10 +1,13 @@
 import asyncio
+import bisect
 import sys
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
+from io import StringIO
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -22,6 +25,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from agent.config import load_config
 from agent.core import Agent, markdown_body
+from agent.status import ActivityTracker
 from agent.context_window import get_context_window
 from session.sqlite_session import SessionManager
 
@@ -78,7 +82,7 @@ def _show_dialogue_message(console: Console, role: str, content: str, timestamp=
         console.print(content, markup=False, highlight=False)
 
 
-def _show_dialogue_history(console: Console, history: list[dict]):
+def _show_dialogue_history(console: Console, history: list[dict], trailing_blank=True):
     messages = [
         message for message in history
         if message["role"] in ("user", "assistant")
@@ -104,7 +108,40 @@ def _show_dialogue_history(console: Console, history: list[dict]):
                     pass
             last_user_time = None
         _show_dialogue_message(console, message["role"], message["content"].strip(), timestamp, elapsed)
-    console.print()
+    if trailing_blank:
+        console.print()
+
+
+class DialogueHistoryPager:
+    def __init__(self, session_manager, session_id, page_size=40):
+        self._session_manager = session_manager
+        self._session_id = session_id
+        self._page_size = page_size
+        self._before_id = None
+        self.exhausted = False
+
+    def next_page(self):
+        if self.exhausted:
+            return []
+        messages = []
+        before_id = self._before_id
+        while True:
+            batch = self._session_manager.get_history_before(self._session_id, before_id, self._page_size)
+            if not batch:
+                self.exhausted = True
+                self._before_id = None
+                return messages
+            messages = batch + messages
+            visible_users = [
+                i for i, message in enumerate(messages)
+                if message["role"] == "user" and not message.get("tool_calls")
+                and (message.get("content") or "").strip()
+            ]
+            if visible_users:
+                first = visible_users[0]
+                self._before_id = messages[first]["id"]
+                return messages[first:]
+            before_id = batch[0]["id"]
 
 
 def select_session(console: Console, session_manager: SessionManager) -> str:
@@ -189,6 +226,7 @@ class ChatRunner:
         self._draft = self._prompt_session.default_buffer.document
         self._prompt_session.default_buffer.reset()
         self._confirmation_active = True
+        self._agent.activity.set("confirm_wait")
         self._prompt_session.app.invalidate()
 
     def take_draft(self):
@@ -213,6 +251,8 @@ class ChatRunner:
         except queue.Empty:
             return False
         self._confirmation_active = False
+        # 确认后命令继续执行，恢复为命令执行态
+        self._agent.activity.set("cmd_exec", "确认后继续")
         reply.put(text)
         self._prompt_session.app.invalidate()
         return True
@@ -249,18 +289,24 @@ class ChatRunner:
             except Exception as exc:
                 self._console.print(f"[bold red]错误：{exc}[/bold red]")
             finally:
+                self._agent.activity.set("idle")
                 self._jobs.task_done()
                 self._prompt_session.app.invalidate()
 
 
-def _paint_activity_icon(output, frame):
+def _paint_status_line(output, frame, status_text):
+    """流式输出期间直画状态行（保底路径，与 bottom_toolbar 内容一致）。"""
     output.write_raw("\x1b7")
     output.cursor_goto(output.get_size().rows, 2)
-    output.write_raw(f"\x1b[0;32;7m{frame}\x1b8")
+    output.write_raw(f"\x1b[0;32;7m{frame} {status_text}\x1b8")
     output.flush()
 
 
 class OutputPane:
+    _VISIBLE_LINES = 200
+    _SGR_PATTERN = re.compile(r"(?:\x1b\[|\x9b)[0-9;]*m")
+    _NEWLINE_PATTERN = re.compile("\n")
+
     def __init__(self, app):
         self._app = app
         self._text = ""
@@ -269,16 +315,58 @@ class OutputPane:
         self._rendered_line = 0
         self._response_owner = None
         self._response_spans = []
+        self._formatted_cache = None
+        self._line_starts = [0]
+        self._style_offset = 0
+        self._style_prefix = ""
+
+    def _index_from(self, start):
+        del self._line_starts[bisect.bisect_right(self._line_starts, start):]
+        self._line_starts.extend(
+            match.end() for match in self._NEWLINE_PATTERN.finditer(self._text, start)
+        )
+        if start < self._style_offset:
+            self._style_offset = 0
+            self._style_prefix = ""
+
+    def _prefix_at(self, start):
+        if start < self._style_offset:
+            self._style_offset = 0
+            self._style_prefix = ""
+        for match in self._SGR_PATTERN.finditer(self._text, self._style_offset, start):
+            sequence = match.group()
+            if sequence in ("\x1b[m", "\x1b[0m", "\x9bm", "\x9b0m"):
+                self._style_prefix = ""
+            else:
+                self._style_prefix += sequence
+        self._style_offset = start
+        return self._style_prefix
 
     def write(self, text):
         with self._lock:
+            start = len(self._text)
             if self._response_owner is threading.current_thread() and text:
-                self._response_spans.append((len(self._text), len(self._text) + len(text)))
+                self._response_spans.append((start, start + len(text)))
             self._text += text
+            self._index_from(start)
+            self._formatted_cache = None
             if self._scrollback:
                 self._scrollback += text.count("\n")
         self._app.invalidate()
         return len(text)
+
+    def prepend(self, text):
+        if not text:
+            return
+        with self._lock:
+            self._text = text + self._text
+            self._response_spans = [(start + len(text), end + len(text)) for start, end in self._response_spans]
+            self._line_starts = [0]
+            self._style_offset = 0
+            self._style_prefix = ""
+            self._index_from(0)
+            self._formatted_cache = None
+        self._app.invalidate()
 
     def flush(self):
         pass
@@ -309,6 +397,8 @@ class OutputPane:
                 end = last
             parts.append(self._text[end:])
             self._text = "".join(parts)
+            self._index_from(start)
+            self._formatted_cache = None
             if self._scrollback:
                 self._scrollback = max(0, self._scrollback + rendered.count("\n") - previous.count("\n"))
             self._response_owner = None if final else threading.current_thread()
@@ -320,11 +410,17 @@ class OutputPane:
 
     def formatted_text(self):
         with self._lock:
-            text = self._text
-            if self._scrollback:
-                text = "".join(text.splitlines(keepends=True)[:-self._scrollback])
-            self._rendered_line = text.count("\n")
-        return ANSI(text)
+            if self._formatted_cache is None:
+                end = len(self._text)
+                if self._scrollback:
+                    line_count = len(self._line_starts) - int(self._text.endswith("\n"))
+                    end = self._line_starts[line_count - self._scrollback]
+                end_line = bisect.bisect_left(self._line_starts, end)
+                start = self._line_starts[max(0, end_line - self._VISIBLE_LINES)]
+                text = self._prefix_at(start) + self._text[start:end]
+                self._rendered_line = text.count("\n")
+                self._formatted_cache = ANSI(text)
+            return self._formatted_cache
 
     def cursor_position(self):
         with self._lock:
@@ -332,9 +428,14 @@ class OutputPane:
 
     def scroll(self, lines):
         with self._lock:
-            max_scroll = max(0, len(self._text.splitlines(keepends=True)) - 1)
-            self._scrollback = max(0, min(self._scrollback + lines, max_scroll))
+            line_count = len(self._line_starts) - int(self._text.endswith("\n"))
+            max_scroll = max(0, line_count - 1)
+            requested = self._scrollback + lines
+            self._scrollback = max(0, min(requested, max_scroll))
+            remaining = max(0, requested - max_scroll)
+            self._formatted_cache = None
         self._app.invalidate()
+        return remaining
 
     def clear(self):
         with self._lock:
@@ -343,6 +444,10 @@ class OutputPane:
             self._rendered_line = 0
             self._response_owner = None
             self._response_spans = []
+            self._formatted_cache = None
+            self._line_starts = [0]
+            self._style_offset = 0
+            self._style_prefix = ""
         self._app.invalidate()
 
 
@@ -370,7 +475,8 @@ def main():
         console.print("[dim]请检查 config.toml 中 [memory] 配置，以及嵌入模型 API key 和 base_url 是否正确。[/dim]")
         sys.exit(1)
     prompt_prefix = config["agent"].get("prompt_prefix", "🤖")
-    initial_history = session_manager.get_history(session_id)
+    history_pager = DialogueHistoryPager(session_manager, session_id)
+    initial_history = history_pager.next_page()
     is_new_session = not initial_history
 
     console.print(f"\n[dim]会话：{session_id}  模型：{model}  输入 /help 查看命令[/dim]\n")
@@ -383,12 +489,24 @@ def main():
     frames = "◐◓◑◒"
 
     def _context_toolbar():
-        """底部固定状态栏：显示工作状态和最近一次请求的输入用量。"""
+        """底部固定状态栏：显示当前阶段 + 最近一次请求的输入用量。"""
         try:
-            activity = (
-                f"<ansigreen>{frames[int(time.monotonic() * 4) % len(frames)]}</ansigreen>"
-                if chat_runner.busy else "<ansibrightblack>○</ansibrightblack>"
+            background = agent.activity.get_background()
+            background_text = (
+                f"  <ansicyan>⟳{ActivityTracker.LABELS.get(background, background)}</ansicyan>"
+                if background else ""
             )
+            if chat_runner.busy:
+                phase, _, elapsed = agent.activity.get()
+                label = ActivityTracker.LABELS.get(phase, phase)
+                status = f"{label} {elapsed:.0f}s"
+                activity = (
+                    f"<ansigreen>{frames[int(time.monotonic() * 4) % len(frames)]}</ansigreen>"
+                    f" <b>{status}</b>"
+                )
+            else:
+                activity = "<ansibrightblack>○ 待命</ansibrightblack>"
+            activity += background_text
             context = getattr(agent, "_context_metrics", {})
             if context.get("model") != agent.model or "prompt_estimate" not in context:
                 return HTML(f" {activity}  <b>模型:</b> {agent.model}  <b>最近请求:</b> 尚未计算 ")
@@ -423,7 +541,19 @@ def main():
 
     def _scroll_output(lines):
         output_window.vertical_scroll = max(0, output_window.vertical_scroll - lines)
-        output_pane.scroll(lines)
+        remaining = output_pane.scroll(lines)
+        while remaining and not history_pager.exhausted:
+            page = history_pager.next_page()
+            if not page:
+                break
+            buffer = StringIO()
+            history_console = Console(
+                file=buffer, width=console.width, force_terminal=console.is_terminal,
+                color_system=console.color_system, legacy_windows=console.legacy_windows,
+            )
+            _show_dialogue_history(history_console, page, trailing_blank=False)
+            output_pane.prepend(buffer.getvalue())
+            remaining = output_pane.scroll(remaining)
 
     @bindings.add("up")
     def _scroll_up(event):
@@ -459,8 +589,16 @@ def main():
             await asyncio.sleep(0.25)
             if not chat_runner.busy or prompt_session.app._running_in_terminal:
                 continue
+            phase, _, elapsed = agent.activity.get()
+            label = ActivityTracker.LABELS.get(phase, phase)
+            status = f"{label} {elapsed:.0f}s"
+            background = agent.activity.get_background()
+            if background:
+                status += f"  ⟳{ActivityTracker.LABELS.get(background, background)}"
             output = prompt_session.app.output
-            _paint_activity_icon(output, frames[int(time.monotonic() * 4) % len(frames)])
+            _paint_status_line(output, frames[int(time.monotonic() * 4) % len(frames)], status)
+            # busy 时阶段/秒数会变化，需周期性刷新工具栏；空闲时无需重绘
+            prompt_session.app.invalidate()
 
     def _start_prompt():
         chat_runner.activate_confirmation()
@@ -591,6 +729,8 @@ def main():
         elif user_input == "/session new":
             new_id = session_manager.create_session("new")
             agent.switch_session(new_id)
+            session_id = new_id
+            history_pager = DialogueHistoryPager(session_manager, session_id)
             is_new_session = True
             output_pane.clear()
             console.print(f"[green]已创建并切换到新会话：{new_id}[/green]")
@@ -616,7 +756,9 @@ def main():
                 if 0 <= idx < len(sessions):
                     target = sessions[idx]
                     agent.switch_session(target["id"])
-                    history = session_manager.get_history(target["id"])
+                    session_id = target["id"]
+                    history_pager = DialogueHistoryPager(session_manager, session_id)
+                    history = history_pager.next_page()
                     is_new_session = not history
                     output_pane.clear()
                     console.print(f"[green]已切换到会话：{target['name']}（{target['id']}）[/green]")
@@ -677,6 +819,7 @@ def main():
                 console.file = output_pane
             if confirm == "y":
                 session_manager.clear_messages(session_id)
+                history_pager = DialogueHistoryPager(session_manager, session_id)
                 agent._history_cache = None
                 output_pane.clear()
                 console.print("[green]会话消息已清除。[/green]")

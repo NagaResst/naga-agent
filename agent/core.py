@@ -19,6 +19,7 @@ import tools.memory as memory_module
 import tools.mcp as mcp_module
 from agent.token_tracker import TokenTracker, input_budget
 from agent.subagent import DELEGATE_TASKS_DEFINITION, SubtaskRunner
+from agent.status import ActivityTracker
 from agent.skill_registry import discover_skills, _extract_match_terms, _normalize_skill_text
 from agent.context_window import get_context_window
 from agent.context_window import (
@@ -47,6 +48,7 @@ class Agent:
         self.session_id = session_id
         self.model = model
         self.console = console
+        self.activity = ActivityTracker()
         self.auto_confirm = config["agent"]["auto_confirm"]
         self.max_history = config["agent"]["max_history"]
 
@@ -135,6 +137,7 @@ class Agent:
             api_key=config["api_key"],
             base_url=config.get("base_url"),
             storage=session_manager,
+            activity=self.activity,
         )
         memory_module.set_memory_manager(self._memory_manager)
         if self._memory_manager.available:
@@ -164,7 +167,7 @@ class Agent:
                     console.print("[yellow]子 Agent 使用独立地址时必须提供 SUBAGENT_API_KEY，分派已禁用。[/yellow]")
             if child_client is not self._client or not delegation.get("base_url"):
                 self._subtask_runner = SubtaskRunner(
-                    child_client, delegation["model"], self.tool_definitions, self.tool_executors,
+                    child_client, delegation["model"], self._select_tools("") or [], self.tool_executors,
                     lambda model, usage: self._token_tracker.record_usage(
                         self.session_manager, self.session_id, model, usage
                     ),
@@ -172,6 +175,7 @@ class Agent:
                     max_rounds=delegation.get("max_rounds", 3),
                     context_token_limit=delegation.get("context_token_limit", 0),
                     base_url=delegation.get("base_url") or config.get("base_url"),
+                    tool_dispatcher=self._call_tool,
                 )
 
         # 启动时扫描并加载 skills/ 目录下所有 skill
@@ -846,9 +850,9 @@ class Agent:
         if self._subtask_runner and self.config.get("delegation", {}).get("enabled"):
             base_prompt += (
                 "\n\n【子任务分派】\n"
-                "你是主 Agent，直接处理用户请求。仅当任务可拆成独立、简单、只读的小任务时，"
-                "才调用 delegate_tasks；为每个任务提供完成所需背景。"
-                "子 Agent 的结果是参考信息，最终判断、写入操作与答复仍由你负责。"
+                "你是主 Agent，直接处理用户请求。仅当任务独立且边界清晰时，才调用 delegate_tasks；"
+                "为每个任务提供完成所需背景。子 Agent 可使用已配置工具，包括命令执行和 MCP；"
+                "确保副作用严格处于用户授权范围内。子 Agent 的结果仍需核查。"
             )
 
         # 会话主题（内联标签协议）
@@ -965,7 +969,8 @@ class Agent:
             for message in raw_messages
         ]
 
-        fitted = self._fit_messages(raw_messages, context_window, active_tools)
+        # history 已在上方 _prune_tool_history 裁剪过，此处跳过重复扫描
+        fitted = self._fit_messages(raw_messages, context_window, active_tools, prune=False)
         self._context_metrics = {
             "window": context_window,
             "input_budget": budget,
@@ -991,6 +996,10 @@ class Agent:
     def _prune_tool_history(self, messages: list[dict]) -> list[dict]:
         keep_rounds = max(0, int(self.config.get("agent", {}).get("tool_result_keep_rounds", 3)))
         batches = []
+        latest_user_index = max(
+            (index for index, message in enumerate(messages) if message.get("role") == "user"),
+            default=-1,
+        )
         for index, message in enumerate(messages):
             calls = message.get("tool_calls") or []
             if message.get("role") != "assistant" or not calls:
@@ -1003,7 +1012,10 @@ class Agent:
                 following += 1
             if expected and expected == replies:
                 batches.append((index, following))
-        expired = batches[:-keep_rounds] if keep_rounds else batches
+        previous_turn_batches = [batch for batch in batches if batch[0] < latest_user_index]
+        current_turn_batches = [batch for batch in batches if batch[0] >= latest_user_index]
+        previous_keep_rounds = max(0, keep_rounds - len(current_turn_batches))
+        expired = previous_turn_batches[:-previous_keep_rounds] if previous_keep_rounds else previous_turn_batches
         removed = set()
         replacements = {}
         for start, end in expired:
@@ -1014,8 +1026,10 @@ class Agent:
             removed.update(range(start + 1, end))
         return [replacements.get(index, message) for index, message in enumerate(messages) if index not in removed]
 
-    def _fit_messages(self, messages: list, context_window: int, tools: list | None) -> list:
-        messages = self._prune_tool_history(messages) if hasattr(self, "config") else messages
+    def _fit_messages(self, messages: list, context_window: int, tools: list | None, prune: bool = True) -> list:
+        # prune=False：调用方已裁剪过（如 _get_messages 内），跳过重复扫描；
+        # 工具循环内必须保持 True——每轮新增 tool 批次会移动 keep_rounds 边界。
+        messages = self._prune_tool_history(messages) if prune and hasattr(self, "config") else messages
         budget = self._prompt_budget(context_window, tools)
         system = [message for message in messages if message.get("role") == "system"]
         summary = [message for message in messages if message.get("role") == "user" and
@@ -1087,6 +1101,7 @@ class Agent:
             if self._delegation_calls >= self.config["delegation"].get("max_calls", 2):
                 return "错误：本轮子任务分派次数已达上限，请使用现有结果完成答复"
             self._delegation_calls += 1
+            self.activity.set("delegate", f"{len(args.get('tasks', []))}个")
             return self._subtask_runner.execute(args)
         if name == "mcp" and not mcp_module.configured():
             return "错误：未配置 MCP server"
@@ -1095,6 +1110,7 @@ class Agent:
             return f"错误：未找到工具 '{name}'"
         tools_cfg = self.config.get("tools", {})
         if name == "execute_command":
+            self.activity.set("cmd_exec", (args.get("command") or "")[:40])
             return execute_command_module.execute(
                 args,
                 auto_confirm=self.auto_confirm,
@@ -1102,6 +1118,14 @@ class Agent:
                 timeout=tools_cfg.get("command_timeout", 30),
                 output_max_chars=tools_cfg.get("output_max_chars", 3000),
             )
+        if name == "read_file":
+            self.activity.set("read_file", args.get("path") or "")
+        elif name == "mcp":
+            self.activity.set("mcp", f"{args.get('server', '')}/{args.get('tool', '')}")
+        elif name == "memory":
+            self.activity.set("memory_tool", f"{args.get('layer', '')}/{args.get('action', '')}")
+        elif name == "skill_manager":
+            self.activity.set("skill", args.get("action", ""))
         return executor(args)
 
     def _humanize_tool_hint(self, tool_name: str, tool_args: dict) -> str:
@@ -1170,6 +1194,7 @@ class Agent:
         return (extra_body or None), (top_level or None)
 
     def chat(self, user_input: str) -> str:
+        self.activity.set("prepare")
         self._delegation_calls = 0
         self._snapshot_runtime_state()
         self._reset_runtime_state(user_input)
@@ -1234,6 +1259,7 @@ class Agent:
                 if top_level_params:
                     kwargs.update(top_level_params)
 
+                self.activity.set("llm_wait")
                 try:
                     stream = self._client.chat.completions.create(**kwargs)
                 except Exception as _api_err:
@@ -1287,7 +1313,8 @@ class Agent:
                         response_started = True
                     self.console.print(text, end="", markup=False, highlight=False)
                     full_content += text
-                    if response_started and time.monotonic() - last_render_at >= 0.1:
+                    render_interval = max(0.25, min(1.0, len(full_content) / 40000))
+                    if response_started and time.monotonic() - last_render_at >= render_interval:
                         render_response()
                         last_render_at = time.monotonic()
 
@@ -1317,6 +1344,7 @@ class Agent:
                     rc = getattr(delta, "reasoning_content", None)
                     if rc:
                         if not in_reasoning:
+                            self.activity.set("reasoning")
                             if self.config["agent"].get("show_thinking", True):
                                 self.console.print("\n[dim italic]思考中...[/dim italic]")
                             in_reasoning = True
@@ -1327,6 +1355,8 @@ class Agent:
                         if in_reasoning:
                             self.console.print()
                             in_reasoning = False
+                        if not response_started:
+                            self.activity.set("llm_stream")
                         if not _theme_done:
                             _tbuf += delta.content
                             close_idx = _tbuf.find(_TCLOSE)
@@ -1472,7 +1502,14 @@ class Agent:
             self._memory_manager.increment_turn()
             if self._memory_manager.should_extract():
                 extract_turns = self.config.get("memory", {}).get("extract_history_turns", 20)
-                history = self.session_manager.get_history(self.session_id)
+                # 增量读取：复用 _get_messages 刚更新的 _history_cache，
+                # 再补齐本轮新增消息（assistant 回复/工具批次），等价于 get_history 全量
+                cached = getattr(self, "_history_cache", None)
+                if cached and cached[0] == self.session_id:
+                    last_id = cached[2][-1]["id"] if cached[2] else cached[1]
+                    history = cached[2] + self.session_manager.get_history_since(self.session_id, last_id)
+                else:
+                    history = self.session_manager.get_history(self.session_id)
                 turn_count = 0
                 selected = []
                 for m in reversed(history):
@@ -1483,6 +1520,7 @@ class Agent:
                             break
                 messages_for_mem = [{"role": m["role"], "content": m["content"]} for m in selected]
                 self._memory_manager.extract_async(messages_for_mem)
+        self.activity.set("idle")
         return last_content
 
     def get_token_summary(self) -> dict:

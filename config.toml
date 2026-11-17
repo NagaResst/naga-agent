@@ -33,7 +33,7 @@ prompt_prefix = "你"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
 context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
 context_compact_ratio = 0.75      # 已用输入达到此比例时归档完整旧轮次
-tool_result_keep_rounds = 3       # 仅最近 3 批工具调用及其结果进入上下文
+tool_result_keep_rounds = 30       # 历史工具结果保留上限；当前用户轮次全部保留（仍受上下文窗口约束）
 runtime_state_max_chars = 1800    # 运行参考状态的最大字符数
 runtime_tool_events_max_items = 6 # 运行状态中最多保留多少条最近工具动作
 runtime_findings_max_items = 6    # 运行状态中最多保留多少条最近已验证结果

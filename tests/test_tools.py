@@ -19,8 +19,9 @@ from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 from prompt_toolkit.layout.controls import FormattedTextControl
 
 from agent.core import Agent
-from main import ChatRunner, OutputPane, _invoked_skill, _paint_activity_icon, _show_dialogue_history
-from tools import mcp, skill_manager
+from main import ChatRunner, DialogueHistoryPager, OutputPane, _invoked_skill, _paint_status_line, _show_dialogue_history
+from session.sqlite_session import SessionManager
+from tools import mcp, read_file, skill_manager
 from tools.registry import discover_tools
 
 
@@ -35,6 +36,27 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(names, {"execute_command", "read_file", "memory", "skill_manager", "mcp"})
         self.assertEqual(names, set(executors))
 
+    def test_read_file_returns_more_than_3000_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.txt"
+            expected = "line of file content\n" * 400
+            path.write_text(expected, encoding="utf-8")
+
+            result = read_file.execute({"path": str(path)})
+
+        self.assertIn(expected, result)
+        self.assertNotIn("已截断", result)
+
+    def test_read_file_still_caps_very_large_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "huge.txt"
+            path.write_text("x" * 20000, encoding="utf-8")
+
+            result = read_file.execute({"path": str(path)})
+
+        self.assertIn("已截断", result)
+        self.assertLess(len(result), 12500)
+
     def test_skill_command_recognizes_only_exact_leading_name(self):
         skills = [{"name": "review", "enabled": True}]
         self.assertIs(_invoked_skill("/review check this", skills), skills[0])
@@ -44,12 +66,12 @@ class ToolTests(unittest.TestCase):
     def test_activity_icon_only_updates_bottom_toolbar_cell(self):
         output = Mock()
         output.get_size.return_value.rows = 18
-        _paint_activity_icon(output, "◐")
+        _paint_status_line(output, "◐", "待命")
         self.assertEqual(output.mock_calls, [
             unittest.mock.call.write_raw("\x1b7"),
             unittest.mock.call.get_size(),
             unittest.mock.call.cursor_goto(18, 2),
-            unittest.mock.call.write_raw("\x1b[0;32;7m◐\x1b8"),
+            unittest.mock.call.write_raw("\x1b[0;32;7m◐ 待命\x1b8"),
             unittest.mock.call.flush(),
         ])
 
@@ -83,6 +105,78 @@ class ToolTests(unittest.TestCase):
         content = control.create_content(80, 10)
         self.assertEqual(content.line_count, 1)
         self.assertEqual(content.cursor_position, Point(x=0, y=0))
+
+    def test_output_pane_renders_bounded_history_and_scrolls_to_old_lines(self):
+        pane = OutputPane(Mock())
+        pane.write("\x1b[31m" + "".join(f"line {n}\n" for n in range(500)) + "\x1b[0m")
+
+        fragments = to_formatted_text(pane.formatted_text())
+        displayed = fragment_list_to_text(fragments)
+        self.assertNotIn("line 0\n", displayed)
+        self.assertIn("line 499\n", displayed)
+        self.assertTrue(any("ansired" in style for style, text in fragments if "l" in text))
+        pane.scroll(499)
+        self.assertIn("line 0\n", fragment_list_to_text(to_formatted_text(pane.formatted_text())))
+        pane.scroll(-499)
+        self.assertIn("line 499\n", fragment_list_to_text(to_formatted_text(pane.formatted_text())))
+
+    def test_output_pane_keeps_scrollback_anchor_during_writes(self):
+        pane = OutputPane(Mock())
+        pane.write("".join(f"line {n}\n" for n in range(500)))
+        pane.scroll(100)
+        before = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        pane.write("new line\n")
+        after = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertEqual(after, before)
+
+    def test_output_pane_caches_snapshot_until_content_changes(self):
+        pane = OutputPane(Mock())
+        pane.write("first")
+        snapshot = pane.formatted_text()
+        self.assertIs(pane.formatted_text(), snapshot)
+        pane.write(" second")
+        self.assertIsNot(pane.formatted_text(), snapshot)
+        self.assertEqual(fragment_list_to_text(to_formatted_text(pane.formatted_text())), "first second")
+
+    def test_history_pager_loads_complete_turns_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SessionManager(str(Path(directory) / "history.db"))
+            session_id = manager.create_session("pages")
+            for number in range(5):
+                manager.append_message(session_id, "user", f"question {number}")
+                manager.append_message(session_id, "assistant", "", {"tool_calls": [{"id": str(number)}]})
+                manager.append_message(session_id, "tool", f"internal {number}")
+                manager.append_message(session_id, "assistant", f"answer {number}")
+            pager = DialogueHistoryPager(manager, session_id, page_size=3)
+            pages = []
+            while not pager.exhausted:
+                page = pager.next_page()
+                visible = [
+                    item for item in page
+                    if item["role"] in ("user", "assistant") and not item.get("tool_calls")
+                    and item["content"].strip()
+                ]
+                if visible:
+                    self.assertEqual(visible[0]["role"], "user")
+                    pages.append(visible)
+            displayed = [item["content"] for page in reversed(pages) for item in page]
+            self.assertEqual(
+                displayed,
+                [text for number in range(5) for text in (f"question {number}", f"answer {number}")],
+            )
+            manager.close()
+
+    def test_prepend_keeps_scrollback_and_response_replacement(self):
+        pane = OutputPane(Mock())
+        pane.write("recent\n")
+        pane.start_response()
+        pane.write("stream")
+        pane.scroll(1)
+        pane.prepend("older\n")
+        pane.finish_response("final")
+        pane.scroll(-100)
+        displayed = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+        self.assertEqual(displayed, "older\nrecent\nfinal")
 
     def test_restored_session_shows_complete_dialogue_without_tool_output(self):
         output = StringIO()

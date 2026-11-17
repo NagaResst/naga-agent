@@ -14,6 +14,7 @@ class RemoteMemoryTests(unittest.TestCase):
     @staticmethod
     def _manager():
         manager = MemoryManager.__new__(MemoryManager)
+        manager._activity = None
         manager._cfg = {"reranker": {
             "model": "Qwen3-Reranker-8B",
             "base_url": "https://example.test/v1",

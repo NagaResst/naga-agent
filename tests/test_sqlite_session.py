@@ -76,6 +76,22 @@ class SessionSchemaTests(unittest.TestCase):
             self.assertEqual(history[1]["content"], "result")
             reopened.close()
 
+    def test_history_pages_use_stable_exclusive_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SessionManager(str(Path(directory) / "pages.db"))
+            session_id = manager.create_session("pages")
+            for number in range(5):
+                manager.append_message(session_id, "user", str(number))
+            other_id = manager.create_session("other")
+            manager.append_message(other_id, "user", "other")
+            newest = manager.get_history_before(session_id, limit=2)
+            manager.append_message(session_id, "assistant", "new message")
+            older = manager.get_history_before(session_id, before_id=newest[0]["id"], limit=3)
+            self.assertEqual([item["content"] for item in newest], ["3", "4"])
+            self.assertEqual([item["content"] for item in older], ["0", "1", "2"])
+            self.assertEqual(manager.get_history_before(session_id, before_id=older[0]["id"]), [])
+            manager.close()
+
 
 if __name__ == "__main__":
     unittest.main()
