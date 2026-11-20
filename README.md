@@ -9,7 +9,7 @@
 - **模型无关**：连接任意 OpenAI 兼容接口（OpenAI、Anthropic、DeepSeek、Qwen、MiniMax、本地 Ollama 等）
 - **模型驱动分派**：主模型直接处理请求，必要时将独立的简单只读任务交给低成本子 Agent
 - **工具调用**：Shell 命令执行、文件读写编辑、脚本生成、网页搜索与抓取、记忆管理
-- **三层记忆**：SQLite 核心记忆 + mem0 向量情节记忆 + 历史摘要，跨会话持久化，无需外部服务
+- **记忆与历史**：可关闭长期记忆，或选择本地文件/远程向量记忆；会话历史及摘要独立保存
 - **上下文预算**：自动探测模型窗口，按完整对话轮次裁剪历史消息与超长工具输出
 - **Skill 系统**：按需加载 `.md` 格式的专项能力提示词
 - **思维链支持**：透明展示模型推理过程（支持 MiniMax M2.7 reasoning_split、Qwen enable_thinking 等）
@@ -65,6 +65,11 @@ default = "GLM-5.3"    # 默认主模型，需与服务端支持的名称一致
 available = ["GLM-5.3"]
 base_url = "https://your-provider.example/v1"
 
+[model.extra_headers]
+User-Agent = "opencode/1.18.4"
+HTTP-Referer = "https://opencode.ai/"
+X-Title = "opencode"
+
 [delegation]
 enabled = false               # 当前提供商未列出独立子模型
 model = ""                     # 有可用子模型时再配置并启用
@@ -72,12 +77,21 @@ max_tasks = 3                 # 单次最多 3 个子任务
 max_rounds = 3                # 子 Agent 每个任务最多 3 轮只读工具调用
 max_calls = 2                 # 主 Agent 单轮最多分派 2 次
 
+[delegation.extra_headers]   # 仅独立子模型地址生效
+User-Agent = "opencode/1.18.4"
+HTTP-Referer = "https://opencode.ai/"
+X-Title = "opencode"
+
 [agent]
 context_token_limit = 0        # 0 = 自动检测，非零时强制覆盖
 
 [memory]
-backend = "qdrant"             # 需启动 localhost:6333 的 Qdrant 服务
+enabled = false               # 关闭长期记忆；会话历史和摘要仍保留
+backend = "local"             # local 无向量服务；qdrant 使用远程向量记忆
+local_path = "naga.db.memory" # 本地记忆文件，切勿提交
 ```
+
+主模型 Header 用于模型请求和模型信息查询；子 Agent 共用主客户端时使用主模型 Header，独立地址使用 `[delegation.extra_headers]`，不会继承主模型 Header。敏感值可写成 `${ENV_NAME}` 并在环境变量或 `.env` 中设置；变量缺失会报错，不要将密钥直接写进配置文件。
 
 ### 运行
 
@@ -85,7 +99,7 @@ backend = "qdrant"             # 需启动 localhost:6333 的 Qdrant 服务
 python3 main.py
 ```
 
-启动后选择模型和会话，进入交互 REPL。
+启动后选择模型和会话，进入交互 REPL。横幅固定在终端顶部；窗口较小时会缩为单行，极小窗口中隐藏以保留输入栏。
 
 ---
 
@@ -102,6 +116,10 @@ python3 main.py
 | `mcp` | 列出已配置 MCP server 的工具并调用；未配置时不暴露 |
 | `delegate_tasks` | 按需交给低成本子 Agent，未配置子模型时不提供 |
 
+命令输出中无法按本地编码解码的字节会替换并明确提示。工具执行异常会作为错误结果返回给模型；操作可能已部分执行，重试前应先核查。
+
+命令结果默认最多 32000 字符（`[tools].output_max_chars`），文件内容最多 64000 字符，MCP 结果默认最多 64000 字符（`[mcp].output_max_chars`）。超限时会提示截断；文件可通过行范围分段读取。
+
 `config.toml` 已配置 Anysearch Streamable HTTP MCP（60 秒连接超时）。在环境变量或不提交的 `.env` 中设置 `ANYSEARCH_API_KEY`，重启 Agent 后用 `mcp` 的 `list` 查看 `anysearch` 工具目录，指定 `tool` 再次 `list` 查看参数 schema，最后用 `call` 调用。缺少 Key 时不会连接；`X-Anysearch-Client` 已配置为 `mcp/1.0.0`。其他 MCP server 可通过 `[mcp.servers.<name>]` 配置 `url`（HTTP）或 `command`、`args`（stdio）；`enabled = false` 可停用。MCP server 的权限由服务端决定，配置前请核对其提供的读写能力。Skill 文件由用户自行放入 `skills/`，启停可用 `/skill on/off` 或 `skill_manager`。
 
 自定义工具：在 `tools/` 目录下新建 `.py` 文件，实现 `TOOL_DEFINITION` 和 `execute(args)` 即可自动注册。
@@ -110,21 +128,21 @@ python3 main.py
 
 ## 分层记忆系统
 
-记忆分三层，由 mem0 + SQLite + Qdrant 共同支撑：
+长期记忆可关闭或选择后端；会话历史摘要独立于长期记忆：
 
 ```
-Layer1  核心记忆（SQLite KV）
+Layer1  核心记忆
         ──────────────────────────────────────────────
         用户的长期偏好、固定配置、身份信息。
         按剩余预算作为参考数据提供，不构成 system 指令。
         通过 memory 工具的 save/list/delete 操作显式管理。
         进程内缓存预热，冷启动后精确查找仍可用。
 
-Layer2  情节记忆（mem0 + 向量库）
+Layer2  情景记忆
         ──────────────────────────────────────────────
         过往对话中的关键事件和操作结论。
-        系统每 N 轮自动提取（可配置 extract_every_n_turns）。
-        每轮根据当前话题语义检索 Top-K 条作为参考数据提供。
+        Qdrant 模式可定期自动提取及语义检索。
+        本地模式只主动保存，使用关键词匹配检索。
 
 Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
         ──────────────────────────────────────────────
@@ -132,7 +150,11 @@ Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
         恢复会话时从覆盖 ID 后继续读取原文；摘要仅是参考信息。
 ```
 
-当前配置需要 `localhost:6333` 的 Qdrant 服务。`[memory.embedder]` 使用远程 `Qwen3-Embedding-8B`（OpenAI 兼容 `/v1/embeddings`），`[memory.reranker]` 使用 `Qwen3-Reranker-8B`（`/v1/rerank`），接口不可用时召回会保留向量排序。嵌入维度设为 4096，写入新集合 `mem0_qwen3_embedding_8b`；旧 768 维 `mem0` 集合的数据不会自动迁移。
+当前配置 `enabled = false`，不会加载、注入或写入长期记忆，也不暴露记忆工具或启动嵌入 daemon。已有数据不会删除；会话历史、摘要和 SQLite 会话数据库仍然使用。要启用本地模式，设置 `enabled = true` 和 `backend = "local"`，然后重启。
+
+本地模式将核心和情景记忆保存在 `local_path` 指定的 SQLite 文件（相对路径从项目根目录解析）；新文件仅允许当前用户访问。它不依赖 Qdrant、向量、嵌入或重排服务，检索使用英文词及中文相邻字符匹配，而非语义检索；仅通过记忆工具主动保存，**不自动从对话提取**。本地文件可能包含敏感内容，不要提交或公开。它与 Qdrant 模式的数据相互独立，不自动迁移；切换后旧数据仍保留。
+
+选择 `backend = "qdrant"` 时，核心记忆使用会话 SQLite，情景记忆需要 `localhost:6333` 的 Qdrant 服务。`[memory.embedder]` 使用远程 `Qwen3-Embedding-8B`（OpenAI 兼容 `/v1/embeddings`），`[memory.reranker]` 使用 `Qwen3-Reranker-8B`（`/v1/rerank`），接口不可用时召回会保留向量排序。嵌入维度设为 4096，写入新集合 `mem0_qwen3_embedding_8b`；旧 768 维 `mem0` 集合的数据不会自动迁移。
 情景记忆的写入、检索和列表统一使用 `[memory]` 的 `agent_id`（默认 `naga-agent`），跨会话共享。更改该值后，旧作用域的记忆不再被当前查询返回；此前未设置归属 ID 的旧记忆也不会自动迁移。Qdrant 客户端版本不匹配提示已在 mem0 初始化时单独隐藏，但客户端与服务端版本并未因此变得兼容。
 
 在环境变量或不提交的 `.env` 中设置 `VECTOR_API_KEY`；未设置时，嵌入和重排会复用主模型的 `OPENAI_API_KEY`。不要把密钥写入 `config.toml`。当前配置不启动本地嵌入 daemon。
@@ -141,9 +163,11 @@ Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
 
 ## 子任务分派
 
-每条用户消息直接由当前主模型处理，不再先请求分类模型。启用 `[delegation]` 且配置低成本 `model`（或 `SUBAGENT_MODEL`）后，主模型可按需调用 `delegate_tasks`，一次提交最多 `max_tasks` 个独立任务。子任务顺序执行、上下文互不共享，仅可使用 `read_file`，结果返回主模型，由主模型完成最终判断和回复。子任务不会再创建子 Agent；其模型用量单独记入会话统计。
+每条用户消息直接由当前主模型处理，不再先请求分类模型。启用 `[delegation]` 且配置低成本 `model`（或 `SUBAGENT_MODEL`）后，主模型可按需调用 `delegate_tasks`，一次提交最多 `max_tasks` 个独立任务。子任务顺序执行、上下文互不共享，可使用已注册工具（不允许嵌套分派），结果返回主模型，由主模型完成最终判断和回复。子任务不会再创建子 Agent；其模型用量单独记入会话统计。
 
 子任务描述和背景没有固定字符数限制，但仍受子模型的上下文窗口和输入 token 预算约束，超出预算时会返回错误。
+
+子 Agent 接收工具的完整返回结果，必要时根据子模型上下文预算截断；每个子任务返回主模型的结果最多 64000 字符，超过时会提示截断。
 
 `/delegate on/off` 控制当前进程的分派功能；`/model auto` 仅恢复配置中的默认主模型。没有配置子模型时不展示分派工具，不影响主模型直接调用原有工具。
 
@@ -151,7 +175,7 @@ Layer3  历史摘要（SQLite，带最后覆盖消息 ID）
 
 ## 上下文预算
 
-`context_token_limit = 0` 时，Agent 按服务地址和模型名从 provider 元数据探测窗口；已确认值一天后重新验证，可向下更新，探测失败时暂用上次可信值。接口不提供可靠值时回退到 131072 token（128k），实际窗口更小时须手动指定正数覆盖。system 仅包含配置和代码中的固定指令；工具 schema 独立传给模型并先计入预算。所有 Skill 的原始 frontmatter 始终作为参考目录注入；自动匹配的正文按预算加载，`/{skillname}` 指定时注入入口文件全文；主题、运行状态、历史摘要、核心与情景记忆都是带标签的参考数据，不作为 system 指令。记忆最多占窗口的 10% 且不超过 2048 token。默认仅最近 3 批配对工具调用和结果进入上下文，旧批次在压缩前成对剔除，不写进摘要；用户请求和助手结论继续保留。思维链只作流式展示，从不写入会话或再次送给模型。输入达到可用预算约 75% 时归档已经完成的旧轮次，并在 SQLite 保存摘要覆盖 ID；原始工具结果仍留在 SQLite 供追溯，清空会话时删除。过长工具输出仅截断发送副本；最新用户输入仍放不下时会明确报错。子 Agent 使用相同预算算法，其窗口可用 `[delegation].context_token_limit` 覆盖。`/token` 显示最近一次上下文估算和摘要进度；估算与 API usage 校准，不保证精确。
+`context_token_limit = 0` 时，Agent 按服务地址和模型名从 provider 元数据探测窗口；已确认值一天后重新验证，可向下更新，探测失败时暂用上次可信值。接口不提供可靠值时回退到 131072 token（128k），实际窗口更小时须手动指定正数覆盖。system 仅包含配置和代码中的固定指令；工具 schema 独立传给模型并先计入预算。所有 Skill 的原始 frontmatter 始终作为参考目录注入；自动匹配的正文按预算加载，`/{skillname}` 指定时注入入口文件全文；主题、运行状态、历史摘要、核心与情景记忆都是带标签的参考数据，不作为 system 指令。记忆最多占窗口的 10% 且不超过 2048 token。默认保留最近 30 批配对工具调用和结果，当前用户轮次的工具批次全部保留；旧批次在压缩前成对剔除，不写进摘要。思维链只作流式展示，从不写入会话或再次送给模型。输入达到可用预算约 75% 时归档已经完成的旧轮次，并在 SQLite 保存摘要覆盖 ID；原始工具结果仍留在 SQLite 供追溯，清空会话时删除。过长工具输出仅截断发送副本；最新用户输入仍放不下时会明确报错。子 Agent 使用相同预算算法，其窗口可用 `[delegation].context_token_limit` 覆盖。`/token` 显示最近一次上下文估算和摘要进度；估算与 API usage 校准，不保证精确。
 
 底部状态栏以绿色旋转圆圈 / 灰色空心圆 `○` 标识是否有正在处理或排队的消息，并显示最近一次实际发送请求的输入估算（消息加工具 schema），不是持久化历史的累计值；`/token` 可查看消息、schema 和 API 返回的最近真实输入。预留的生成空间不算作已用 token。GLM 等模型与 `tiktoken` 编码不完全一致，估算会随 API usage 渐进校准。若首次启动显示 `unavailable` 且编码下载遇到证书错误，可在项目虚拟环境中用系统证书链缓存编码（不关闭 TLS 验证）：
 
@@ -266,11 +290,11 @@ min_match_score = 2.2
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `max_history` | 50 | 请求中最多保留的历史消息数，按完整对话轮次裁剪（SQLite 不删） |
+| `max_history` | 150 | 历史消息数目标，按完整对话轮次裁剪；最新轮可超过此值（SQLite 不删） |
 | `auto_confirm` | true | 命令自动确认（false 时危险命令需手动确认） |
 | `context_token_limit` | 0 | 0=自动检测，非零=强制覆盖上下文窗口大小 |
 | `context_compact_ratio` | 0.75 | 达到输入预算比例时压缩完整旧轮次 |
-| `tool_result_keep_rounds` | 3 | 上下文中保留的最近配对工具批次数，0 为全部丢弃 |
+| `tool_result_keep_rounds` | 30 | 最近配对工具批次的目标数；当前用户轮次全部保留，0 仅丢弃旧轮次的批次 |
 | `show_thinking` | true | 是否展示思维链内容；不会持久化或回送 |
 | `system_prompt_file` | — | 系统提示词文件路径 |
 
@@ -278,9 +302,11 @@ min_match_score = 2.2
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `backend` | chroma | 向量库后端（chroma/qdrant） |
-| `extract_every_n_turns` | 3 | 自动提取情节记忆的间隔轮数 |
-| `episodic_top_k` | 3 | 情节记忆语义检索返回条数 |
+| `enabled` | true | 长期记忆总开关；当前配置为 false |
+| `backend` | qdrant | `local` 本地文件或 `qdrant` 向量记忆 |
+| `local_path` | `naga.db.memory` | 本地记忆 SQLite 文件路径 |
+| `extract_every_n_turns` | 10 | Qdrant 自动提取间隔；0 关闭；local 不自动提取 |
+| `episodic_inject_k` | 5 | 最多注入多少条检索结果 |
 | `core_max_items` | 20 | 核心记忆参考条目的最大条数 |
 
 ---

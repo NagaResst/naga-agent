@@ -1,3 +1,4 @@
+import locale
 import re
 import subprocess
 
@@ -38,10 +39,25 @@ FORCE_CONFIRM_PATTERNS = [
 def _truncate_output(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
-    head = text[:max_chars - 600]
-    tail = text[-500:]
-    omitted_lines = text[max_chars - 600:-500].count("\n")
-    return f"{head}\n[...截断 {omitted_lines} 行，输出过长已省略...]\n{tail}"
+    marker = f"\n[...输出已截断，原始长度 {len(text)} 字符...]\n"
+    available = max_chars - len(marker)
+    if available < 1:
+        return "错误：命令输出上限过小，请提高 tools.output_max_chars"
+    tail_size = min(4000, available // 4)
+    head = text[:available - tail_size]
+    tail = text[-tail_size:] if tail_size else ""
+    return head + marker + tail
+
+
+def _decode_output(data: bytes, encoding: str) -> tuple[str, bool]:
+    try:
+        text = data.decode(encoding)
+        replaced = False
+    except UnicodeDecodeError:
+        text = data.decode(encoding, errors="replace")
+        replaced = True
+    return text.replace("\r\n", "\n").replace("\r", "\n"), replaced
+
 
 TOOL_DEFINITION = {
     "type": "function",
@@ -60,7 +76,7 @@ TOOL_DEFINITION = {
 }
 
 
-def execute(args: dict, auto_confirm: bool = False, console=None, timeout: int = 30, output_max_chars: int = 3000) -> str:
+def execute(args: dict, auto_confirm: bool = False, console=None, timeout: int = 30, output_max_chars: int = 32000) -> str:
     command = args.get("command", "").strip()
     description = args.get("description", "")
 
@@ -94,16 +110,26 @@ def execute(args: dict, auto_confirm: bool = False, console=None, timeout: int =
             command,
             shell=True,
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
         status = "成功" if result.returncode == 0 else f"失败（返回码 {result.returncode}）"
-        stdout = result.stdout.strip() if result.stdout else "（无输出）"
-        stderr = result.stderr.strip() if result.stderr else "（无）"
+        encoding = locale.getpreferredencoding(False)
+        stdout, stdout_replaced = _decode_output(result.stdout, encoding)
+        stderr, stderr_replaced = _decode_output(result.stderr, encoding)
+        stdout = stdout.strip() if stdout else "（无输出）"
+        stderr = stderr.strip() if stderr else "（无）"
+        affected = [name for name, replaced in (
+            ("标准输出", stdout_replaced), ("错误输出", stderr_replaced),
+        ) if replaced]
+        warning = (
+            f"警告：{'、'.join(affected)}含无法按 {encoding} 解码的字节，已用替换字符表示，输出可能不完整。\n"
+            if affected else ""
+        )
         raw = (
             f"[命令执行结果]\n"
             f"命令：{command}\n"
             f"状态：{status}\n"
+            f"{warning}"
             f"--- 标准输出 ---\n"
             f"{stdout}\n"
             f"--- 错误输出 ---\n"

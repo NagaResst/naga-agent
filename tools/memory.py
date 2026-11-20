@@ -12,7 +12,7 @@ TOOL_DEFINITION = {
     "type": "function",
     "function": {
         "name": "memory",
-        "description": "持久化记忆系统。layer=core（核心偏好，全量注入，≤20条/≤200字符）或 layer=episodic（情景记忆，语义检索，无限制）。",
+        "description": "持久化记忆系统。layer=core（核心偏好，全量注入）或 layer=episodic（情景记忆，可检索）；检索方式取决于配置的后端。",
         "parameters": {
             "type": "object",
             "properties": {

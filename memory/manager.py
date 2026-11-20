@@ -7,6 +7,8 @@ from urllib.parse import urljoin
 
 import requests
 
+from memory.local import LocalMemoryStore
+
 os.environ["MEM0_TELEMETRY"] = "False"
 
 
@@ -47,20 +49,23 @@ def _build_mem0_config(memory_cfg: dict, api_key: str, base_url: str | None = No
 class MemoryManager:
     """记忆管理器。
 
-    Layer1 核心记忆（core）:
-      - SQLite 持久化，进程内 _core_cache 加速
-      - 全量注入 system prompt，上限 core_max_items 条，单条 core_max_chars
-      - 支持 save / list / delete（按 ID）
-      - 不碰 mem0
-
-    Layer2 情景记忆（episodic）:
-      - mem0 SDK 管理，Qdrant 持久化
-      - 自动提取(每 N 轮) + 手动保存 + 语义检索 + 按 ID 删除
+    核心记忆和情景记忆由所选后端持久化；本地模式使用关键词检索且不自动提取。
     """
 
     def __init__(self, memory_cfg: dict, api_key: str = "", base_url: str | None = None, storage=None, activity=None):
         self._cfg = memory_cfg
-        self._storage = storage
+        backend = memory_cfg.get("backend", "qdrant")
+        if backend not in ("local", "qdrant"):
+            raise ValueError(f"不支持的记忆后端：{backend}（可选 local 或 qdrant）")
+        self._local = None
+        if backend == "local":
+            path = memory_cfg.get("local_path", "naga.db.memory")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError("memory.local_path 必须是非空文件路径")
+            if not os.path.isabs(path):
+                path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
+            self._local = LocalMemoryStore(path)
+        self._storage = self._local if self._local is not None else storage
         self._api_key = api_key
         # 核心记忆缓存 {id: {"content": str, "created_at": str}}
         self._core_cache: dict[str, dict] = {}
@@ -69,23 +74,24 @@ class MemoryManager:
         self._activity = activity
 
         # mem0 初始化
-        try:
-            from mem0 import Memory
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", message=r"^Qdrant client version .* is incompatible with server version .*",
-                    category=UserWarning,
-                )
-                self._mem0 = Memory(config=_build_mem0_config(memory_cfg, api_key, base_url))
-        except Exception as e:
-            print(f"[MemoryManager] mem0 初始化失败，情景记忆不可用。错误：{e}")
+        if self._local is None:
+            try:
+                from mem0 import Memory
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message=r"^Qdrant client version .* is incompatible with server version .*",
+                        category=UserWarning,
+                    )
+                    self._mem0 = Memory(config=_build_mem0_config(memory_cfg, api_key, base_url))
+            except Exception as e:
+                print(f"[MemoryManager] mem0 初始化失败，情景记忆不可用。错误：{e}")
 
         # 预热核心记忆
         self._load_core_cache()
 
     @property
     def available(self) -> bool:
-        return self._mem0 is not None
+        return getattr(self, "_local", None) is not None or self._mem0 is not None
 
     # ── 内部 ────────────────────────────────────────────────
 
@@ -152,6 +158,9 @@ class MemoryManager:
         if not content:
             return "错误：内容不能为空"
         memory_id = uuid.uuid4().hex[:8]
+        if getattr(self, "_local", None) is not None:
+            self._local.save_episodic(memory_id, content)
+            return f"已保存，ID: {memory_id}"
         try:
             self._mem0.add(
                 [{"role": "assistant", "content": content}],
@@ -165,6 +174,8 @@ class MemoryManager:
     def recall_episodic(self, query: str, top_k: int = 15) -> list[dict]:
         if not self.available or not query.strip():
             return []
+        if getattr(self, "_local", None) is not None:
+            return self._local.recall_episodic(query, top_k)
         try:
             if self._activity is not None:
                 self._activity.set("memory_search", query[:30])
@@ -228,6 +239,8 @@ class MemoryManager:
             return "错误：情景记忆不可用（mem0 未初始化）"
         if not memory_id.strip():
             return "错误：memory_id 不能为空"
+        if getattr(self, "_local", None) is not None:
+            return f"已删除：{memory_id}" if self._local.delete_episodic(memory_id) else f"未找到记忆：{memory_id}"
         try:
             # mem0 搜索匹配的 memory_id
             scope = {"agent_id": self._cfg.get("agent_id", "naga-agent")}
@@ -256,6 +269,8 @@ class MemoryManager:
     def list_episodic(self, top_k: int = 20) -> list[dict]:
         if not self.available:
             return []
+        if getattr(self, "_local", None) is not None:
+            return self._local.list_episodic(top_k)
         try:
             results = self._mem0.get_all(filters={"agent_id": self._cfg.get("agent_id", "naga-agent")}, top_k=top_k)
             memories = results if isinstance(results, list) else results.get("results", [])
@@ -278,6 +293,8 @@ class MemoryManager:
     # ── 自动提取 ─────────────────────────────────────────────
 
     def should_extract(self) -> bool:
+        if getattr(self, "_local", None) is not None:
+            return False
         every_n = self._cfg.get("extract_every_n_turns", 10)
         if every_n <= 0:
             return False
@@ -286,6 +303,8 @@ class MemoryManager:
     def extract_async(self, messages: list):
         if not getattr(self, "available", False):
             return
+        if getattr(self, "_local", None) is not None:
+            raise RuntimeError("本地记忆模式不支持自动提取，请通过记忆工具主动保存")
         activity = getattr(self, "_activity", None)
 
         def _run(*args, **kwargs):

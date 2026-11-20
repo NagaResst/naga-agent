@@ -757,25 +757,59 @@ class OutputPane:
         self._app.invalidate()
 
 
+_BANNER_TITLE = "Naga CLI Agent"
+_BANNER_DESCRIPTION = "终端 AI 助手 · 输入 /help 查看命令"
+
+
 def _configure_prompt_layout(prompt_session, output_pane):
     # Keep the input shrinkable; reserve menu space in the outer layout instead.
     prompt_session.reserve_space_for_menu = 0
     layout = prompt_session.app.layout
+
+    def banner_height():
+        size = prompt_session.app.output.get_size()
+        if size.rows < 5:
+            return 0
+        if size.rows < 12 or size.columns < get_cwidth(_BANNER_DESCRIPTION) + 4:
+            return 1
+        return 4
+
+    def banner_text():
+        width = prompt_session.app.output.get_size().columns
+        if banner_height() < 4:
+            return [("bold ansicyan", f" {_BANNER_TITLE}"), ("ansibrightblack", " · /help")]
+        border = "─" * (width - 2)
+        fragments = [("ansicyan", f"╭{border}╮\n")]
+        for text, style in ((_BANNER_TITLE, "bold ansicyan"), (_BANNER_DESCRIPTION, "ansibrightblack")):
+            fragments.extend([
+                ("ansicyan", "│ "),
+                (style, text),
+                ("ansicyan", " " * (width - get_cwidth(text) - 3) + "│\n"),
+            ])
+        fragments.append(("ansicyan", f"╰{border}╯"))
+        return fragments
+
+    banner = Window(FormattedTextControl(banner_text), height=banner_height, wrap_lines=False)
     output_window = Window(
         FormattedTextControl(output_pane.formatted_text, get_cursor_position=output_pane.cursor_position),
         wrap_lines=True,
-        height=Dimension(weight=1),
+        height=lambda: Dimension(preferred=prompt_session.app.output.get_size().rows, weight=1),
     )
     layout.container.height = lambda: Dimension(
         min=3, preferred=8 if prompt_session.default_buffer.complete_state else 3, max=8,
     )
-    prompt_session.app.layout = Layout(HSplit([output_window, layout.container]), focused_element=layout.current_window)
+    prompt_session.app.layout = Layout(
+        HSplit([banner, output_window, layout.container]), focused_element=layout.current_window,
+    )
     return output_window
 
 
 def main():
     console = Console()
-    console.print(Panel("[bold cyan]Naga CLI Agent[/bold cyan]", subtitle="OpenAI 兴容模式对话助手"))
+    console.print(Panel(
+        f"[bold cyan]{_BANNER_TITLE}[/bold cyan]\n[dim]{_BANNER_DESCRIPTION}[/dim]",
+        border_style="cyan",
+    ))
 
     config = load_config()
 
@@ -793,8 +827,8 @@ def main():
     try:
         agent = Agent(config, session_manager, session_id, model, console)
     except Exception as e:
-        console.print(f"[bold red]记忆系统初始化失败，无法启动：{e}[/bold red]")
-        console.print("[dim]请检查 config.toml 中 [memory] 配置，以及嵌入模型 API key 和 base_url 是否正确。[/dim]")
+        console.print(f"[bold red]Agent 初始化失败，无法启动：{e}[/bold red]")
+        console.print("[dim]请检查模型、子 Agent 和记忆配置，以及所需的环境变量。[/dim]")
         sys.exit(1)
     prompt_prefix = config["agent"].get("prompt_prefix", "🤖")
     history_pager = DialogueHistoryPager(session_manager, session_id)

@@ -1,17 +1,18 @@
 import asyncio
 import json
 import os
-import re
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from agent.headers import resolve_headers
+
 
 _servers = {}
 _timeout = 20
-_output_max_chars = 16000
+_output_max_chars = 64000
 
 
 TOOL_DEFINITION = {
@@ -37,7 +38,7 @@ def set_config(config: dict):
     global _servers, _timeout, _output_max_chars
     _servers = config.get("servers", {})
     _timeout = config.get("timeout", 20)
-    _output_max_chars = config.get("output_max_chars", 16000)
+    _output_max_chars = config.get("output_max_chars", 64000)
 
 
 def configured() -> bool:
@@ -45,16 +46,7 @@ def configured() -> bool:
 
 
 def _resolve_headers(headers: dict) -> dict:
-    def replace_env(match):
-        name = match.group(1)
-        if not os.environ.get(name):
-            raise ValueError(f"缺少 MCP 环境变量：{name}")
-        return os.environ[name]
-
-    return {
-        name: re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replace_env, value)
-        for name, value in headers.items()
-    }
+    return resolve_headers(headers, "MCP")
 
 
 async def _exchange(read_stream, write_stream, action: str, tool: str, arguments: dict, timeout: int) -> str:
@@ -71,7 +63,7 @@ async def _exchange(read_stream, write_stream, action: str, tool: str, arguments
                         }, ensure_ascii=False)
                 return f"错误：未找到 MCP 工具：{tool}"
             return json.dumps([
-                {"name": item.name, "description": (item.description or "")[:160]}
+                {"name": item.name, "description": item.description or ""}
                 for item in tools.tools
             ], ensure_ascii=False)
         result = await asyncio.wait_for(session.call_tool(tool, arguments), timeout=timeout)
@@ -128,4 +120,9 @@ def execute(args: dict) -> str:
         return f"错误：MCP server {name} 请求失败：{exc}"
     if action == "list" and len(result) > _output_max_chars:
         return "错误：MCP 工具列表超过输出上限，请提高 mcp.output_max_chars"
-    return result[:_output_max_chars]
+    if len(result) > _output_max_chars:
+        suffix = f"\n[MCP 输出已截断，原始长度 {len(result)} 字符]"
+        if _output_max_chars <= len(suffix):
+            return "错误：MCP 输出上限过小，请提高 mcp.output_max_chars"
+        return result[:_output_max_chars - len(suffix)] + suffix
+    return result

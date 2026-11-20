@@ -108,9 +108,10 @@ class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_history_menu_and_status_fit_and_resize(self):
         class Output(DummyOutput):
             rows = 24
+            columns = 100
 
             def get_size(self):
-                return Size(rows=self.rows, columns=100)
+                return Size(rows=self.rows, columns=self.columns)
 
             def get_rows_below_cursor_position(self):
                 return self.rows
@@ -125,13 +126,14 @@ class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
         _configure_prompt_layout(session, pane)
 
         def render():
+            session.app.render_counter += 1
             screen = Screen()
             session.app.layout.container.write_to_screen(
-                screen, MouseHandlers(), WritePosition(0, 0, 100, output.rows), "", False, None,
+                screen, MouseHandlers(), WritePosition(0, 0, output.columns, output.rows), "", False, None,
             )
             screen.draw_all_floats()
             return "\n".join(
-                "".join(screen.data_buffer[y][x].char for x in range(100)).rstrip()
+                "".join(screen.data_buffer[y][x].char for x in range(output.columns)).rstrip()
                 for y in range(output.rows)
             )
 
@@ -139,7 +141,15 @@ class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
             idle = render()
             self.assertNotIn("Window too small", idle)
             self.assertIn("STATUS", idle)
-            self.assertGreaterEqual(idle.count("history"), 20)
+            self.assertTrue(idle.splitlines()[0].startswith("╭"))
+            self.assertIn("Naga CLI Agent", idle.splitlines()[1])
+            self.assertNotIn("OpenAI 兼容", idle)
+            self.assertGreaterEqual(idle.count("history"), 16)
+            self.assertGreaterEqual(session.app.layout.container.preferred_height(100, 24).preferred, 24)
+            pane.scroll(10)
+            pane.write("new output\n")
+            scrolled = render()
+            self.assertEqual(scrolled.splitlines()[:4], idle.splitlines()[:4])
             session.default_buffer.document = Document("/", 1)
             completions = list(session.completer.get_completions(session.default_buffer.document, None))
             session.default_buffer.complete_state = CompletionState(
@@ -157,11 +167,25 @@ class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Window too small", rendered)
             self.assertIn("STATUS", rendered)
             self.assertIn("input > /", rendered)
+            self.assertIn("Naga CLI Agent", rendered.splitlines()[0])
+
+            output.rows = 4
+            rendered = render()
+            self.assertNotIn("Window too small", rendered)
+            self.assertIn("STATUS", rendered)
+            self.assertIn("input > /", rendered)
+
+            output.columns = 20
+            output.rows = 24
+            rendered = render()
+            self.assertIn("Naga CLI Agent", rendered.splitlines()[0])
+            self.assertIn("STATUS", rendered)
 
             output.rows = 24
+            output.columns = 100
             self.assertIn("/thinking", render())
             session.default_buffer.complete_state = None
-            self.assertGreaterEqual(render().count("history"), 20)
+            self.assertGreaterEqual(render().count("history"), 16)
 
 
 if __name__ == "__main__":

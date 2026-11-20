@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import sys
 import tempfile
 import threading
@@ -23,7 +24,7 @@ from agent.core import Agent
 from agent.subagent import SubtaskRunner
 from main import ChatRunner, DialogueHistoryPager, OutputPane, _invoked_skill, _paint_status_line, _show_dialogue_history
 from session.sqlite_session import SessionManager
-from tools import mcp, read_file, skill_manager
+from tools import execute_command, mcp, read_file, skill_manager
 from tools.registry import discover_tools
 
 
@@ -38,10 +39,75 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(names, {"execute_command", "read_file", "memory", "skill_manager", "mcp"})
         self.assertEqual(names, set(executors))
 
+    def test_command_reports_incomplete_utf8_without_stopping(self):
+        script = "import os; os.write(1, b'hello \\xe4\\xb8'); os.write(2, b'problem \\xff')"
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        result = execute_command.execute(
+            {"command": command, "description": "test output decoding"}, auto_confirm=True,
+        )
+
+        self.assertIn("状态：成功", result)
+        self.assertIn("标准输出", result)
+        self.assertIn("错误输出", result)
+        self.assertIn("hello �", result)
+        self.assertIn("problem �", result)
+        self.assertIn("解码", result)
+        self.assertIn("替换", result)
+
+    def test_command_preserves_valid_output_and_failure_status(self):
+        script = "import sys; print('正常'); print('失败', file=sys.stderr); sys.exit(2)"
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        result = execute_command.execute(
+            {"command": command, "description": "test exit status"}, auto_confirm=True,
+        )
+
+        self.assertIn("状态：失败（返回码 2）", result)
+        self.assertIn("正常", result)
+        self.assertIn("失败", result)
+        self.assertNotIn("警告：", result)
+
+    def test_command_keeps_medium_output_and_marks_oversized_output(self):
+        script = "print('x' * 10000)"
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        result = execute_command.execute(
+            {"command": command, "description": "test long output"}, auto_confirm=True,
+        )
+        self.assertIn("x" * 10000, result)
+        self.assertNotIn("已省略", result)
+
+        script = "print('a' * 40000 + 'end')"
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        result = execute_command.execute(
+            {"command": command, "description": "test truncation"}, auto_confirm=True,
+        )
+        self.assertIn("截断", result)
+        self.assertIn("end", result)
+        self.assertLessEqual(len(result), 32000)
+
+    def test_command_truncation_respects_small_configured_limit(self):
+        script = "print('x' * 1000 + 'end')"
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+        result = execute_command.execute(
+            {"command": command, "description": "test short limit"},
+            auto_confirm=True, output_max_chars=200,
+        )
+        self.assertIn("截断", result)
+        self.assertIn("end", result)
+        self.assertLessEqual(len(result), 200)
+
+    def test_command_truncation_boundary(self):
+        self.assertEqual(execute_command._truncate_output("x" * 32000, 32000), "x" * 32000)
+        truncated = execute_command._truncate_output("x" * 32001, 32000)
+        self.assertIn("32001", truncated)
+        self.assertIn("截断", truncated)
+        self.assertEqual(len(truncated), 32000)
+
     def test_read_file_returns_more_than_3000_characters(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "large.txt"
-            expected = "line of file content\n" * 400
+            expected = "line of file content\n" * 1400
             path.write_text(expected, encoding="utf-8")
 
             result = read_file.execute({"path": str(path)})
@@ -52,13 +118,34 @@ class ToolTests(unittest.TestCase):
     def test_read_file_still_caps_very_large_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "huge.txt"
-            path.write_text("x" * 20000, encoding="utf-8")
+            path.write_text("x" * 70000, encoding="utf-8")
 
             result = read_file.execute({"path": str(path)})
 
         self.assertIn("已截断", result)
         self.assertIn("实际返回：1 行（已截断，末行不完整）", result)
-        self.assertLess(len(result), 12500)
+        self.assertLess(len(result), 64500)
+
+    def test_read_file_truncation_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "boundary.txt"
+            for size, truncated in ((64000, False), (64001, True)):
+                with self.subTest(size=size):
+                    path.write_text("x" * size, encoding="utf-8")
+                    result = read_file.execute({"path": str(path)})
+                    self.assertEqual("已截断" in result, truncated)
+
+    def test_mcp_keeps_medium_output_and_marks_oversized_output(self):
+        mcp.set_config({"servers": {"local": {"command": "unused"}}})
+        args = {"action": "call", "server": "local", "tool": "test"}
+        with patch.object(mcp, "_request", new_callable=AsyncMock) as request:
+            request.return_value = "x" * 64000
+            self.assertEqual(mcp.execute(args), "x" * 64000)
+            request.return_value = "x" * 64001
+            result = mcp.execute(args)
+        self.assertIn("截断", result)
+        self.assertIn("64001", result)
+        self.assertEqual(len(result), 64000)
 
     def test_read_file_reports_requested_range_and_returned_lines(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -663,6 +750,7 @@ class ToolTests(unittest.TestCase):
             "server = FastMCP('test')\n"
             "@server.tool()\n"
             "def echo(message: str) -> str:\n"
+            "    \"\"\"" + "description " * 20 + "\"\"\"\n"
             "    return message\n"
             "server.run(transport='stdio')\n"
         )
@@ -672,6 +760,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(json.loads(mcp.execute({"action": "list"})), {"servers": ["local"]})
         available = json.loads(mcp.execute({"action": "list", "server": "local"}))
         self.assertEqual(available[0]["name"], "echo")
+        self.assertEqual(available[0]["description"], "description " * 20)
         detail = json.loads(mcp.execute({"action": "list", "server": "local", "tool": "echo"}))
         self.assertIn("message", detail["inputSchema"]["properties"])
         response = mcp.execute({

@@ -26,6 +26,7 @@ from agent.context_window import get_context_window
 from agent.context_window import (
     get_context_window,
 )
+from agent.headers import resolve_headers
 from memory.manager import MemoryManager
 
 
@@ -106,14 +107,27 @@ class Agent:
         self._client = OpenAI(
             api_key=config["api_key"],
             base_url=config.get("base_url") or None,
+            default_headers=resolve_headers(config["model"].get("extra_headers", {}), "主模型 Header"),
         )
         self.tool_definitions, self.tool_executors = discover_tools()
-        
+        memory_cfg = config.get("memory", {})
+        memory_enabled = memory_cfg.get("enabled", True)
+        if not isinstance(memory_enabled, bool):
+            raise ValueError("memory.enabled 必须是布尔值")
+        memory_backend = memory_cfg.get("backend", "qdrant")
+        if memory_enabled and memory_backend not in ("local", "qdrant"):
+            raise ValueError(f"不支持的记忆后端：{memory_backend}（可选 local 或 qdrant）")
+        if not memory_enabled:
+            self.tool_definitions = [
+                definition for definition in self.tool_definitions
+                if definition["function"]["name"] != "memory"
+            ]
+            self.tool_executors.pop("memory", None)
 
         # 仅在配置本地嵌入脚本时启动 daemon；远程嵌入无需本地模型。
         self._daemon_proc = None
         daemon_cfg = config.get("embedding_daemon", {})
-        daemon_script = daemon_cfg.get("script_path", "")
+        daemon_script = daemon_cfg.get("script_path", "") if memory_enabled and memory_backend == "qdrant" else ""
         # 支持相对路径：相对于项目根目录解析
         if daemon_script and not os.path.isabs(daemon_script):
             _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -182,16 +196,21 @@ class Agent:
             if daemon_script:
                 console.print(f"[dim yellow]语义引擎脚本不存在：{daemon_script}[/dim yellow]")
 
-        # 初始化分层记忆管理器（必要组件，失败时向上抛出）
-        self._memory_manager = MemoryManager(
-            config["memory"],
-            api_key=config["api_key"],
-            base_url=config.get("base_url"),
-            storage=session_manager,
-            activity=self.activity,
-        )
+        self._memory_manager = None
+        if memory_enabled:
+            self._memory_manager = MemoryManager(
+                memory_cfg,
+                api_key=config["api_key"],
+                base_url=config.get("base_url"),
+                storage=session_manager,
+                activity=self.activity,
+            )
         memory_module.set_memory_manager(self._memory_manager)
-        if self._memory_manager.available:
+        if not memory_enabled:
+            console.print("[dim]记忆系统已关闭[/dim]")
+        elif memory_backend == "local":
+            console.print("[dim]记忆系统已就绪（本地文件，关键词检索，仅主动保存）[/dim]")
+        elif self._memory_manager.available:
             console.print("[dim]记忆系统已就绪（核心记忆 SQLite + 情景记忆 mem0）[/dim]")
         else:
             console.print("[dim]记忆系统已就绪（核心记忆 SQLite，情景记忆不可用）[/dim]")
@@ -213,7 +232,10 @@ class Agent:
             child_client = self._client
             if delegation.get("base_url"):
                 if delegation.get("api_key"):
-                    child_client = OpenAI(api_key=delegation["api_key"], base_url=delegation["base_url"])
+                    child_client = OpenAI(
+                        api_key=delegation["api_key"], base_url=delegation["base_url"],
+                        default_headers=resolve_headers(delegation.get("extra_headers", {}), "子模型 Header"),
+                    )
                 else:
                     console.print("[yellow]子 Agent 使用独立地址时必须提供 SUBAGENT_API_KEY，分派已禁用。[/yellow]")
             if child_client is not self._client or not delegation.get("base_url"):
@@ -1045,7 +1067,7 @@ class Agent:
         return input_budget(context_window, tool_tokens)
 
     def _prune_tool_history(self, messages: list[dict]) -> list[dict]:
-        keep_rounds = max(0, int(self.config.get("agent", {}).get("tool_result_keep_rounds", 3)))
+        keep_rounds = max(0, int(self.config.get("agent", {}).get("tool_result_keep_rounds", 30)))
         batches = []
         latest_user_index = max(
             (index for index, message in enumerate(messages) if self._is_turn_start(message)),
@@ -1198,7 +1220,7 @@ class Agent:
                 auto_confirm=self.auto_confirm,
                 console=self.console,
                 timeout=tools_cfg.get("command_timeout", 30),
-                output_max_chars=tools_cfg.get("output_max_chars", 3000),
+                output_max_chars=tools_cfg.get("output_max_chars", 32000),
             )
         if name == "read_file":
             self.activity.set("read_file", args.get("path") or "")
@@ -1728,7 +1750,14 @@ class Agent:
                         hint = self._humanize_tool_hint(tool_name, tool_args)
                         self.console.print(hint, style="dim italic", markup=False, highlight=False)
 
-                    tool_result = self._call_tool(tool_name, tool_args)
+                    try:
+                        tool_result = self._call_tool(tool_name, tool_args)
+                    except Exception as exc:
+                        tool_result = (
+                            f"错误：工具 {tool_name} 执行异常（{type(exc).__name__}）：{exc}。"
+                            "操作可能已部分执行，请先核查，勿盲目重试。"
+                        )
+                        self.console.print(tool_result, style="bold red", markup=False, highlight=False)
                     if tool_name == "read_file":
                         self.console.print(
                             self._read_file_result_summary(tool_result),

@@ -57,7 +57,7 @@ TOOL_DEFINITION = {
     },
 }
 
-_OUTPUT_MAX_CHARS = 12000
+_OUTPUT_MAX_CHARS = 64000
 
 
 def execute(args: dict) -> str:

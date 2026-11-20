@@ -1,4 +1,6 @@
 import os
+import sqlite3
+import tempfile
 import tomllib
 import unittest
 import warnings
@@ -8,6 +10,9 @@ from unittest.mock import Mock, patch
 import requests
 
 from memory.manager import MemoryManager, _build_mem0_config
+from agent.core import Agent
+from session.sqlite_session import SessionManager
+from tools import memory as memory_tool
 
 
 class RemoteMemoryTests(unittest.TestCase):
@@ -132,6 +137,90 @@ class RemoteMemoryTests(unittest.TestCase):
         with patch("memory.manager.requests.post") as post:
             self.assertEqual(manager.recall_episodic("query")[0]["id"], "a")
         post.assert_not_called()
+
+
+class LocalMemoryTests(unittest.TestCase):
+    def test_local_memory_persists_and_searches_without_vector_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "memory.db")
+            storage = Mock()
+            config = {"backend": "local", "local_path": path, "extract_every_n_turns": 1}
+            with patch("mem0.Memory") as mem0, patch("memory.manager.requests.post") as post:
+                manager = MemoryManager(config, storage=storage)
+                self.assertEqual(os.stat(path).st_mode & 0o077, 0)
+                core_id = manager.save_core("喜欢中文").split(": ")[1]
+                episodic_id = manager.save_episodic("PostgreSQL 数据库迁移方案").split(": ")[1]
+                manager.save_episodic("部署 Redis 缓存")
+                manager.increment_turn()
+                self.assertFalse(manager.should_extract())
+                reopened = MemoryManager(config, storage=storage)
+                self.assertEqual(reopened.list_core()[0]["id"], core_id)
+                self.assertEqual(reopened.recall_episodic("检查数据库 PostgreSQL")[0]["id"], episodic_id)
+                self.assertEqual(reopened.recall_episodic("完全无关"), [])
+                self.assertEqual(len(reopened.list_episodic(top_k=1)), 1)
+                self.assertEqual(reopened.delete_episodic(episodic_id), f"已删除：{episodic_id}")
+                self.assertEqual(reopened.delete_core(core_id), f"已删除：{core_id}")
+                self.assertEqual(MemoryManager(config).list_core(), [])
+                self.assertEqual(MemoryManager(config).recall_episodic("PostgreSQL"), [])
+            mem0.assert_not_called()
+            post.assert_not_called()
+            storage.list_memories.assert_not_called()
+
+    def test_local_storage_failure_is_not_reported_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid.db"
+            path.write_text("not a database", encoding="utf-8")
+            with self.assertRaises(sqlite3.DatabaseError):
+                MemoryManager({"backend": "local", "local_path": str(path)})
+
+
+class MemoryStartupTests(unittest.TestCase):
+    def test_disabled_and_local_skip_daemon_and_external_memory(self):
+        self.addCleanup(memory_tool.set_memory_manager, None)
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SessionManager(str(Path(directory) / "session.db"))
+            self.addCleanup(storage.close)
+            session_id = storage.create_session("test")
+            storage.save_memory("old", "old core preference")
+            storage.append_message(session_id, "user", "new request")
+            config = {
+                "api_key": "test", "model": {"default": "test"}, "delegation": {},
+                "agent": {"auto_confirm": False, "max_history": 10, "context_token_limit": 4096},
+                "embedding_daemon": {"script_path": __file__},
+                "memory": {"enabled": False, "backend": "local", "local_path": str(Path(directory) / "memory.db")},
+            }
+            token_tracker = Mock()
+            token_tracker.count_tokens.side_effect = len
+            token_tracker.estimate.side_effect = lambda messages: sum(len(str(item)) for item in messages)
+            token_tracker.estimate_tools.return_value = 0
+            token_tracker.mode = "test"
+            with patch("agent.core.OpenAI"), patch("agent.core.TokenTracker", return_value=token_tracker), \
+                 patch("agent.core.discover_skills", return_value=[]), \
+                 patch("agent.core.get_context_window", return_value=4096), \
+                 patch("agent.core.subprocess.Popen") as daemon, patch("mem0.Memory") as mem0, \
+                 patch("memory.manager.requests.post") as post:
+                agent = Agent(config, storage, session_id, "test", Mock())
+                self.assertIsNone(agent._memory_manager)
+                self.assertNotIn("memory", [tool["function"]["name"] for tool in agent._select_tools("")])
+                self.assertNotIn("memory", agent.tool_executors)
+                self.assertNotIn("old core preference", str(agent._get_messages()))
+                self.assertEqual(memory_tool.execute({}), "错误：记忆系统未初始化")
+                self.assertFalse(Path(config["memory"]["local_path"]).exists())
+
+                config["memory"]["enabled"] = True
+                agent = Agent(config, storage, session_id, "test", Mock())
+                self.assertTrue(agent._memory_manager.available)
+                self.assertEqual(agent._memory_manager.list_core(), [])
+                self.assertIn("memory", [tool["function"]["name"] for tool in agent._select_tools("")])
+                agent._memory_manager.save_core("new local preference")
+                agent._memory_manager.save_episodic("request guidance")
+                messages = str(agent._get_messages())
+                self.assertIn("new local preference", messages)
+                self.assertIn("request guidance", messages)
+                self.assertNotIn("old core preference", messages)
+                daemon.assert_not_called()
+                mem0.assert_not_called()
+                post.assert_not_called()
 
 
 if __name__ == "__main__":

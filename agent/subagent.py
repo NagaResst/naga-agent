@@ -4,6 +4,9 @@ from agent.context_window import get_context_window
 from agent.token_tracker import TokenTracker, input_budget
 
 
+_RESULT_MAX_CHARS = 64000
+
+
 DELEGATE_TASKS_DEFINITION = {
     "type": "function",
     "function": {
@@ -80,11 +83,14 @@ class SubtaskRunner:
                 return "错误：task 不能为空，context 必须是字符串。"
             try:
                 result = self._run_task(task, context)
-                results.append({"task": task, "status": "ok", "result": result[:4000]})
+                if len(result) > _RESULT_MAX_CHARS:
+                    suffix = f"\n[子 Agent 结果已截断，原始长度 {len(result)} 字符]"
+                    result = result[:_RESULT_MAX_CHARS - len(suffix)] + suffix
+                results.append({"task": task, "status": "ok", "result": result})
             except _SubtaskCancelled:
                 return "错误：子任务已中断。"
             except Exception as exc:
-                results.append({"task": task, "status": "error", "result": str(exc)[:500]})
+                results.append({"task": task, "status": "error", "result": str(exc)})
         return json.dumps({"results": results}, ensure_ascii=False)
 
     def _run_task(self, task: str, context: str) -> str:
@@ -164,6 +170,6 @@ class SubtaskRunner:
                     result = f"错误：工具参数无效：{exc}"
                 messages.append({
                     "role": "tool", "tool_call_id": call.id,
-                    "content": str(result)[:3000],
+                    "content": str(result),
                 })
         raise ValueError("子 Agent 已达到轮次上限")

@@ -27,7 +27,7 @@ flowchart LR
 
 ### 启动与单轮请求
 
-1. `main.py` 加载配置，打开 SQLite 会话存储，选择或创建会话，再构造 `Agent`。`Agent` 发现工具、按配置决定是否启动嵌入 daemon、初始化记忆和低成本子任务执行器、扫描 `skills/`；当前远程嵌入配置不启动 daemon。
+1. `main.py` 加载配置，打开 SQLite 会话存储，选择或创建会话，再构造 `Agent`。`Agent` 发现工具、按配置决定是否初始化记忆和启动嵌入 daemon、初始化低成本子任务执行器、扫描 `skills/`；当前配置关闭长期记忆。
 2. CLI 先处理 `/` 内置命令；普通输入交给 `Agent.chat()`。该方法保存用户消息，读取历史，拼接系统提示词、核心/情景记忆、技能和运行状态，直接调用当前主模型，不做预分类。
 3. 主模型按需调用现有工具，或调用 `delegate_tasks` 分派独立简单任务。子 Agent 使用低成本模型与独立上下文，仅有只读工具；其结果作为工具消息返回主模型继续推理。流式回复可同时包含正文、思考内容与分片函数调用。
 4. 完成后将助手文本写入 SQLite，累计主模型 token 用量；子 Agent 使用量单独记录。满足记忆提取间隔时后台提取情景记忆。
@@ -57,17 +57,17 @@ flowchart LR
 
 `Agent` 会构造用户约束、当前步骤、已读 Skill 文件和工具派生信息等参考状态块，按配置限制条目数与字符数；后续请求可恢复部分上轮状态。技能文件放入 `skills/` 后可通过 CLI 或 `skill_manager` 工具启停；以 `/{skillname}` 开头只选取指定的已启用 Skill，普通请求仍自动匹配。`_match_skills()` 按 frontmatter 关键词与示例打分，并应用 `match_top_k` / `min_match_score`；停用的 Skill 不可被选取。
 
-`Agent` 在组装请求时按探测到的窗口预留生成空间和工具 schema 大小。固定 system 和最新用户轮次优先；记忆只占剩余空间的最多 10% 且不超过 2048 token，过长条目跳过。默认仅最近 3 批工具调用及其结果进入上下文，较早批次在预算判断与压缩之前成对剔除，不写入摘要；用户请求与助手结论仍保留。流式思维链从不持久化或回送给模型。输入超过可用预算的 75% 时，按完整旧轮次生成带来源消息 ID 的有界摘要，保存至 SQLite；原文不删除，恢复时从最后覆盖 ID 继续增量读取。其余按 token 估算和 `max_history` 保留近期轮次；过长工具输出只截断发送副本。主子模型共享预算算法，正向模型窗口缓存一天后重新核验；`/token` 展示最近窗口、schema、输入估算和摘要进度。
+`Agent` 在组装请求时按探测到的窗口预留生成空间和工具 schema 大小。固定 system 和最新用户轮次优先；记忆只占剩余空间的最多 10% 且不超过 2048 token，过长条目跳过。默认保留最近 30 批工具调用及其结果，当前用户轮次的批次全部保留；较早批次在预算判断与压缩之前成对剔除，不写入摘要。流式思维链从不持久化或回送给模型。输入超过可用预算的 75% 时，按完整旧轮次生成带来源消息 ID 的有界摘要，保存至 SQLite；原文不删除，恢复时从最后覆盖 ID 继续增量读取。其余按 token 估算和 `max_history` 保留近期轮次；过长工具输出只截断发送副本。主子模型共享预算算法，正向模型窗口缓存一天后重新核验；`/token` 展示最近窗口、schema、输入估算和摘要进度。
 
 ## 4. 会话与记忆
 
 | 模块 | 功能设计 | 持久化/失败语义 |
 | --- | --- | --- |
 | `session/sqlite_session.py` | `SessionManager` 为各线程创建独立 SQLite 连接，打开 WAL 和外键开关；管理会话增删改查、按 ID 增量读取消息、token 用量、摘要覆盖边界和核心记忆 KV。 | `messages.metadata` 保存附加 JSON，读取时合并进消息；写操作显式 commit。数据库路径来自配置。 |
-| `memory/manager.py` | 核心层缓存 SQLite 记忆，控制条数与单条长度；情景层经 mem0 调用 Qdrant 和远程 OpenAI 兼容 embedding 接口，召回后用 rerank 重排，支持保存、检索、列表、按 ID 删除。 | mem0 初始化异常被捕获，`available=False`，核心记忆仍可工作；rerank 不可用时保留向量排序；每 N 轮可启动后台线程提取历史。 |
-| `tools/memory.py` | 对外提供 `layer=core|episodic` 与 `action=save|recall|delete|list`，委托 `MemoryManager`。 | 核心记忆不提供 recall（每轮全量注入）；情景层 recall 为语义检索。工具管理器由 Agent 初始化时注入。 |
+| `memory/manager.py` / `memory/local.py` | 核心层缓存 SQLite 记忆；情景层可使用本地 SQLite 文件和关键词匹配，或经 mem0 调用 Qdrant、embedding 和 rerank。 | 关闭时不初始化或注入长期记忆；本地模式仅主动保存，无自动提取；mem0 初始化失败时核心记忆仍可工作。 |
+| `tools/memory.py` | 对外提供 `layer=core|episodic` 与 `action=save|recall|delete|list`，委托 `MemoryManager`。 | 核心记忆不提供 recall；情景层检索方式取决于后端。关闭长期记忆时工具不暴露。 |
 
-SQLite 的表为 `sessions`、`messages`、`token_usage`、`summaries`、`memories`。会话消息按自增 ID 排序；用户/助手文本及完成的工具调用链、输出均保留原文。核心记忆跨会话共享；情景记忆由 mem0 管理，当前配置采用 4096 维 Qwen3-Embedding-8B 和 Qdrant `mem0_qwen3_embedding_8b` 集合，旧 `mem0` 数据不会自动迁移。记忆提取间隔由 `extract_every_n_turns` 控制；单次抽取从最近的 `extract_history_turns` 个用户轮次取历史。
+会话 SQLite 的表为 `sessions`、`messages`、`token_usage`、`summaries`、`memories`。会话消息按自增 ID 排序；用户/助手文本及完成的工具调用链、输出均保留原文。长期记忆默认在当前配置中关闭；启用 `local` 时，核心和情景记忆存放于独立 SQLite 文件，按英文词及中文相邻字符匹配，不自动提取，不使用向量服务。启用 `qdrant` 时核心记忆存放于会话数据库，情景记忆由 mem0 管理；提取间隔由 `extract_every_n_turns` 控制。不同后端数据不会自动迁移。关闭记忆不影响会话历史和摘要。
 
 `summaries` 的 `get_summary()` / `set_summary()` 为旧接口；新摘要使用 `get_summary_record()` / `set_summary_record()` 并保存 `last_message_id`。迁移旧数据库时保留文本，覆盖 ID 默认为 0；只有新摘要具备可验证的恢复边界。
 
@@ -78,11 +78,11 @@ SQLite 的表为 `sessions`、`messages`、`token_usage`、`summaries`、`memori
 | 模块 / 工具名 | 输入与行为 | 限制和副作用 |
 | --- | --- | --- |
 | `tools/execute_command.py` / `execute_command` | 接收 `command`、`description`，用子进程 shell 执行；命中黑名单直接拒绝，高风险关键字即使自动确认开启仍要求确认。 | 默认超时按配置；合并 stdout/stderr 并截断返回；规则为正则匹配而非完整安全隔离，不应执行不可信命令。 |
-| `tools/read_file.py` / `read_file` | 接收路径与可选的 1-based 起止行，返回类型、行范围和 UTF-8 文本。 | 输出正文最多 3000 字符，支持继续分段读；相对路径按当前工作目录解析。 |
-| `tools/mcp.py` / `mcp` | 按 `list` 查看已配置的 server/tool 目录，指定 `tool` 查看参数 schema，按 `call` 转发工具参数；支持 stdio 与 Streamable HTTP。 | 仅配置并启用 server 时暴露；HTTP header 支持 `${ENV_VAR}`；缺少变量时拒绝请求。由 MCP 服务端决定具体工具权限。 |
+| `tools/read_file.py` / `read_file` | 接收路径与可选的 1-based 起止行，返回类型、行范围和 UTF-8 文本。 | 输出正文最多 64000 字符，支持继续分段读；相对路径按当前工作目录解析。 |
+| `tools/mcp.py` / `mcp` | 按 `list` 查看已配置的 server/tool 目录，指定 `tool` 查看参数 schema，按 `call` 转发工具参数；支持 stdio 与 Streamable HTTP。 | 默认输出最多 64000 字符，超限提示；仅配置并启用 server 时暴露；HTTP header 支持 `${ENV_VAR}`；缺少变量时拒绝请求。由 MCP 服务端决定具体工具权限。 |
 | `tools/memory.py` / `memory` | 操作两层记忆，支持保存、查询/列表与按 ID 删除。 | 核心层容量有限；情景层取决于 mem0、Qdrant 和嵌入服务可用性。 |
 | `tools/skill_manager.py` / `skill_manager` | `list` 列出、`enable/disable` 启停、`reload` 重扫描已有 Skill。 | 不创建、替换或删除 Skill 文件；进程内启停状态在重新扫描后仍保留。 |
-| `agent/subagent.py` / `delegate_tasks` | 接收任务数组，每项包含任务描述及可选背景；子 Agent 顺序执行、返回分项结果及状态。 | 无共享历史、无嵌套分派；只读白名单，不允许命令执行和文件修改。未配置子模型时不暴露。 |
+| `agent/subagent.py` / `delegate_tasks` | 接收任务数组，每项包含任务描述及可选背景；子 Agent 顺序执行、返回分项结果及状态。 | 无共享历史、无嵌套分派；工具结果按上下文预算控制，每项最终结果最多 64000 字符，超限提示。未配置子模型时不暴露。 |
 
 ### 工具调用时序
 
@@ -150,7 +150,7 @@ sequenceDiagram
 | --- | --- | --- |
 | SQLite | 仓库根目录 `naga.db`（可由 `NAGA_DB_PATH` 改写） | 跨会话长期保存，启动时初始化表。 |
 | Qdrant | `localhost:6333` | 进程外部服务；情景记忆不应与 SQLite 核心层混淆。 |
-| 嵌入与重排 | 远程 OpenAI 兼容 API | `VECTOR_API_KEY` 优先，否则复用主模型 Key；`/v1/rerank` 不可用时保留向量排序。本地 daemon 仅在单独配置脚本路径时启动。 |
+| 嵌入与重排 | 远程 OpenAI 兼容 API | 仅 Qdrant 记忆模式使用；`VECTOR_API_KEY` 优先，否则复用主模型 Key；`/v1/rerank` 不可用时保留向量排序。daemon 仅在 Qdrant 模式且单独配置脚本路径时启动。 |
 | 上下文窗口缓存 | `.context_window_cache.json` | 从模型元数据取得窗口后落盘，按 base URL + 模型区分。 |
 | 生成脚本 | `generated_scripts/` | 工具执行后留在磁盘；需注意同名覆盖和脚本权限。 |
 

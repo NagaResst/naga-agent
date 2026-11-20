@@ -2,10 +2,14 @@
 db_path = "naga.db"   # SQLite 数据库文件路径（相对于项目根目录）
 
 [model]
-default = "GLM-5.3"
-available = ["GLM-5.3"]
+default = "DeepSeek-V4.1-Flash"
+available = ["GLM-5.3-Coding", "DeepSeek-V4.1-Flash"]
 base_url = ""
 
+[model.extra_headers]
+User-Agent = "opencode/1.18.4"
+HTTP-Referer = "https://opencode.ai/"
+X-Title = "opencode"
 
 [delegation]
 enabled = true
@@ -13,16 +17,21 @@ model = "DeepSeek-V4.1-Flash"              # 低成本子模型名；也可设�
 max_tasks = 30            # 单次调用最多分派几个独立任务
 max_rounds = 100           # 每个子 Agent 最多调用几轮只读工具
 max_calls = 20            # 单轮主对话最多分派几次
-context_token_limit = 0 # 子模型窗口；0=按元数据自动探测
+context_token_limit = 1000000 # 子模型窗口；0=按元数据自动探测
+
+[delegation.extra_headers] # 仅子 Agent 使用独立地址时生效；共用客户端时使用主模型 Header
+User-Agent = "opencode/1.18.4"
+HTTP-Referer = "https://opencode.ai/"
+X-Title = "opencode"
 
 [tools]
 command_timeout = 30       # execute_command 超时秒数
-output_max_chars = 3000    # 工具返回结果最大字符数
+output_max_chars = 32000   # 命令返回结果最大字符数
 tool_max_rounds = 90       # 单次对话最大工具调用轮次（防死循环）
 tool_max_errors = 10        # 连续工具错误上限（防错误风暴）
 
 [agent]
-max_history = 50           # 发送给模型的最多历史消息数；按完整对话轮次裁剪
+max_history = 150          # 发送给模型的历史消息数目标；按完整对话轮次裁剪
 auto_confirm = true
 scripts_subdir = "generated_scripts"
 temperature = 0.7
@@ -31,12 +40,12 @@ show_thinking = true
 enable_search = false  # 已锁死，独立计费禁止使用，请勿修改
 prompt_prefix = "你"
 system_prompt_file = "generated_scripts/my_personality_prompt.txt"
-context_token_limit = 0           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
+context_token_limit = 500000           # 0 = 自动检测模型上下文窗口，非零时强制覆盖
 context_compact_ratio = 0.75      # 已用输入达到此比例时归档完整旧轮次
 tool_result_keep_rounds = 30       # 历史工具结果保留上限；当前用户轮次全部保留（仍受上下文窗口约束）
 runtime_state_max_chars = 1800    # 运行参考状态的最大字符数
-runtime_tool_events_max_items = 6 # 运行状态中最多保留多少条最近工具动作
-runtime_findings_max_items = 6    # 运行状态中最多保留多少条最近已验证结果
+runtime_tool_events_max_items = 20 # 运行状态中最多保留多少条最近工具动作
+runtime_findings_max_items = 20    # 运行状态中最多保留多少条最近已验证结果
 runtime_read_skill_files_max_items = 8 # 运行状态中最多保留多少条已读取 skill 资源
 runtime_working_set_max_items = 8
 runtime_completed_steps_max_items = 8
@@ -44,7 +53,7 @@ skill_layer_mode = "auto"
 
 [mcp]
 timeout = 20           # 单次 MCP 请求超时秒数
-output_max_chars = 16000
+output_max_chars = 64000
 
 # 按需配置 stdio MCP server；配置后主 Agent 才会看到 mcp 工具。
 # [mcp.servers.example]
@@ -105,14 +114,15 @@ enabled = [
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
-# 向量库后端
-backend = "qdrant"
+enabled = false            # false=关闭长期记忆；不影响会话历史和摘要
+backend = "local"          # local=本地 SQLite 文件；qdrant=向量记忆
+local_path = "naga.db.memory"  # 相对项目根目录；仅 local 模式使用
 agent_id = "naga-agent"  # mem0 情景记忆跨会话共享的归属 ID，修改后旧作用域不可见
 # Layer1 核心记忆
 core_max_items = 20
 core_max_chars = 200
 # Layer2 情景记忆 — 自动提取
-extract_every_n_turns = 10   # 0=不启用
+extract_every_n_turns = 10   # qdrant 模式自动提取间隔；0=关闭，local 不自动提取
 extract_history_turns = 20
 # 检索
 episodic_search_k = 15

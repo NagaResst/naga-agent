@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -7,11 +8,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
+from openai import OpenAI
 from rich.console import Console
 from prompt_toolkit.formatted_text import to_formatted_text
 from prompt_toolkit.formatted_text.utils import fragment_list_to_text
 
 from agent.core import Agent
+from agent.config import load_config
+from agent.headers import resolve_headers
 from agent.status import ActivityTracker
 from agent.skill_registry import discover_skills
 from agent.subagent import SubtaskRunner
@@ -27,6 +32,101 @@ def response(content=None, calls=None, usage=None):
 
 def tool_call(name, arguments="{}"):
     return SimpleNamespace(id="child-call", function=SimpleNamespace(name=name, arguments=arguments))
+
+
+class HistoryConfigTests(unittest.TestCase):
+    def test_config_preserves_larger_tool_history_limit(self):
+        with patch("agent.config.load_dotenv"), \
+             patch.dict("os.environ", {"OPENAI_API_KEY": "test"}), \
+             patch("agent.config.tomllib.load", return_value={"agent": {"tool_result_keep_rounds": 30}}):
+            config = load_config()
+        self.assertEqual(config["agent"]["tool_result_keep_rounds"], 30)
+        self.assertEqual(config["agent"]["max_history"], 150)
+
+        agent = Agent.__new__(Agent)
+        agent.config = config
+        history = []
+        for i in range(32):
+            history.extend([
+                {"role": "assistant", "tool_calls": [{"id": f"call-{i}"}]},
+                {"role": "tool", "tool_call_id": f"call-{i}", "content": "result"},
+            ])
+        history.append({"role": "user", "content": "next request"})
+        retained = agent._prune_tool_history(history)
+        tool_ids = [message["tool_call_id"] for message in retained if message["role"] == "tool"]
+        self.assertEqual(tool_ids, [f"call-{i}" for i in range(2, 32)])
+
+
+class HeaderConfigurationTests(unittest.TestCase):
+    def test_configured_headers_and_environment_values(self):
+        expected = {
+            "User-Agent": "opencode/1.18.4",
+            "HTTP-Referer": "https://opencode.ai/",
+            "X-Title": "opencode",
+        }
+        with patch("agent.config.load_dotenv"), patch.dict(os.environ, {"OPENAI_API_KEY": "test"}):
+            config = load_config()
+        self.assertEqual(config["model"]["extra_headers"], expected)
+        self.assertEqual(config["delegation"]["extra_headers"], expected)
+        with patch.dict(os.environ, {"HEADER_TEST_SECRET": "test-value"}):
+            self.assertEqual(resolve_headers({"X-Test": "Bearer ${HEADER_TEST_SECRET}"}, "test"),
+                             {"X-Test": "Bearer test-value"})
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "HEADER_TEST_SECRET"):
+                resolve_headers({"X-Test": "${HEADER_TEST_SECRET}"}, "test")
+        with self.assertRaises(ValueError):
+            resolve_headers({"X-Test": 123}, "test")
+
+    def test_headers_reach_chat_and_model_lookup_without_cross_provider_leaks(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if request.url.path.endswith("/models/test"):
+                return httpx.Response(200, json={"id": "test", "object": "model", "created": 0, "owned_by": "test"})
+            return httpx.Response(200, json={
+                "id": "response", "object": "chat.completion", "created": 0, "model": "test",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            })
+
+        def make_client(**kwargs):
+            return OpenAI(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(respond)))
+
+        common = {"User-Agent": "opencode/1.18.4", "HTTP-Referer": "https://opencode.ai/", "X-Title": "opencode"}
+        config = {
+            "api_key": "main-key", "base_url": "https://main.example/v1",
+            "agent": {"auto_confirm": False, "max_history": 10},
+            "model": {"default": "test", "extra_headers": {**common, "X-Main-Only": "${HEADER_TEST_SECRET}"}},
+            "memory": {"enabled": False},
+            "delegation": {"enabled": True, "model": "test", "base_url": "https://child.example/v1",
+                           "api_key": "child-key", "extra_headers": common},
+        }
+        with patch.dict(os.environ, {"HEADER_TEST_SECRET": "main-only"}), \
+             patch("agent.core.OpenAI", side_effect=make_client), \
+             patch("agent.core.discover_skills", return_value=[]), \
+             patch("agent.core.discover_tools", return_value=([], {})), \
+             patch("agent.core.TokenTracker"):
+            agent = Agent(config, Mock(), "test", "test", Mock())
+            agent._client.models.retrieve("test")
+            agent._client.chat.completions.create(model="test", messages=[{"role": "user", "content": "hello"}])
+            agent._subtask_runner.client.chat.completions.create(
+                model="test", messages=[{"role": "user", "content": "hello"}],
+            )
+            config["delegation"]["base_url"] = ""
+            shared_agent = Agent(config, Mock(), "test", "test", Mock())
+            self.assertIs(shared_agent._subtask_runner.client, shared_agent._client)
+            agent._client.close()
+            agent._subtask_runner.client.close()
+            shared_agent._client.close()
+
+        self.assertEqual(len(requests), 3)
+        for request in requests:
+            for name, value in common.items():
+                self.assertEqual(request.headers[name], value)
+        self.assertEqual(requests[0].headers["X-Main-Only"], "main-only")
+        self.assertEqual(requests[1].headers["X-Main-Only"], "main-only")
+        self.assertNotIn("X-Main-Only", requests[2].headers)
+        self.assertEqual(requests[2].url.host, "child.example")
 
 
 class SubtaskRunnerTests(unittest.TestCase):
@@ -72,6 +172,39 @@ class SubtaskRunnerTests(unittest.TestCase):
         sent = client.chat.completions.create.call_args_list[1].kwargs["messages"]
         self.assertEqual(sent[-2]["tool_calls"][0]["id"], sent[-1]["tool_call_id"])
         self.assertLess(len(sent[-1]["content"]), len(original))
+
+    def test_child_keeps_large_tool_output_and_result_within_budget(self):
+        client = Mock()
+        answer = "answer " * 2000
+        original = "tool output " * 2000
+        client.chat.completions.create.side_effect = [
+            response(calls=[tool_call("read_file")]), response(answer),
+        ]
+        runner = SubtaskRunner(
+            client, "child", [{"type": "function", "function": {"name": "read_file"}}],
+            {"read_file": Mock(return_value=original)}, Mock(), context_token_limit=100000,
+        )
+
+        result = json.loads(runner.execute({"tasks": [{"task": "read this"}]}))
+
+        self.assertEqual(client.chat.completions.create.call_args_list[1].kwargs["messages"][-1]["content"], original)
+        self.assertEqual(result["results"][0]["result"], answer.strip())
+
+    def test_child_marks_oversized_final_result(self):
+        client = Mock()
+        runner = SubtaskRunner(client, "child", [], {}, Mock(), context_token_limit=100000)
+
+        client.chat.completions.create.return_value = response("x" * 64000)
+        result = json.loads(runner.execute({"tasks": [{"task": "produce result"}]}))
+        self.assertEqual(result["results"][0]["result"], "x" * 64000)
+
+        client.chat.completions.create.return_value = response("x" * 64001)
+        result = json.loads(runner.execute({"tasks": [{"task": "produce result"}]}))
+        content = result["results"][0]["result"]
+
+        self.assertIn("截断", content)
+        self.assertIn("64001", content)
+        self.assertEqual(len(content), 64000)
 
     def test_isolated_tasks_use_child_model_and_all_registered_tools(self):
         client = Mock()
@@ -765,6 +898,28 @@ class MainAgentDelegationTests(unittest.TestCase):
         self.assertEqual(agent.chat("question"), "task failed")
         self.assertIsNone(agent._client.chat.completions.create.call_args_list[1].kwargs["tools"])
 
+    def test_unexpected_tool_error_is_returned_to_model_and_persisted(self):
+        agent = self._loop_agent()
+        call = SimpleNamespace(index=0, id="failed-call", function=SimpleNamespace(
+            name="read_file", arguments='{"path":"example"}',
+        ))
+        agent._call_tool = Mock(side_effect=RuntimeError("test failure"))
+        agent._client.chat.completions.create.side_effect = [
+            self._stream(calls=[call], finish="tool_calls"), self._stream("handled failure"),
+        ]
+
+        self.assertEqual(agent.chat("question"), "handled failure")
+        batch = agent.session_manager.append_messages.call_args_list[0].args[1]
+        self.assertEqual(batch[1]["tool_call_id"], "failed-call")
+        self.assertIn("错误：", batch[1]["content"])
+        self.assertIn("RuntimeError", batch[1]["content"])
+        self.assertIn("test failure", batch[1]["content"])
+        self.assertIn("部分执行", batch[1]["content"])
+        self.assertTrue(Agent._tool_result_failed("read_file", batch[1]["content"]))
+        self.assertEqual(agent._client.chat.completions.create.call_count, 2)
+        followup = agent._client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        self.assertIn(batch[1], followup)
+
     def test_budget_rejects_oversized_latest_user(self):
         agent = Agent.__new__(Agent)
         agent.activity = ActivityTracker()
@@ -831,12 +986,12 @@ class MainAgentDelegationTests(unittest.TestCase):
             memory.return_value.available = False
             agent = Agent(config, Mock(), "test", "main", Mock())
             self.assertIsNone(agent._subtask_runner)
-            client_factory.assert_called_once_with(api_key="main-key", base_url="https://main.example/v1")
+            client_factory.assert_called_once_with(api_key="main-key", base_url="https://main.example/v1", default_headers={})
 
             config["delegation"]["api_key"] = "child-key"
             agent = Agent(config, Mock(), "test", "main", Mock())
             self.assertIsNotNone(agent._subtask_runner)
-            client_factory.assert_called_with(api_key="child-key", base_url="https://child.example/v1")
+            client_factory.assert_called_with(api_key="child-key", base_url="https://child.example/v1", default_headers={})
             self.assertEqual(agent._subtask_runner.model, "cheap")
 
     def test_delegation_not_exposed_without_child_model(self):
