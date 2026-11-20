@@ -10,16 +10,16 @@ base_url = ""
 [delegation]
 enabled = true
 model = "DeepSeek-V4.1-Flash"              # 低成本子模型名；也可设置 SUBAGENT_MODEL
-max_tasks = 3            # 单次调用最多分派几个独立任务
-max_rounds = 3           # 每个子 Agent 最多调用几轮只读工具
-max_calls = 2            # 单轮主对话最多分派几次
+max_tasks = 30            # 单次调用最多分派几个独立任务
+max_rounds = 100           # 每个子 Agent 最多调用几轮只读工具
+max_calls = 20            # 单轮主对话最多分派几次
 context_token_limit = 0 # 子模型窗口；0=按元数据自动探测
 
 [tools]
 command_timeout = 30       # execute_command 超时秒数
 output_max_chars = 3000    # 工具返回结果最大字符数
 tool_max_rounds = 90       # 单次对话最大工具调用轮次（防死循环）
-tool_max_errors = 3        # 连续工具错误上限（防错误风暴）
+tool_max_errors = 10        # 连续工具错误上限（防错误风暴）
 
 [agent]
 max_history = 50           # 发送给模型的最多历史消息数；按完整对话轮次裁剪

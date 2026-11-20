@@ -30,6 +30,35 @@ def tool_call(name, arguments="{}"):
 
 
 class SubtaskRunnerTests(unittest.TestCase):
+    def test_long_task_and_context_are_sent_without_character_limit(self):
+        client = Mock()
+        client.chat.completions.create.return_value = response("done")
+        runner = SubtaskRunner(client, "child", [], {}, Mock(), context_token_limit=20000)
+        task = "task " * 600
+        context = "context " * 400
+
+        result = json.loads(runner.execute({"tasks": [{"task": task, "context": context}]}))
+
+        self.assertEqual(result["results"][0]["status"], "ok")
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["messages"][-1]["content"],
+                         f"任务：{task.strip()}\n背景：{context}")
+
+    def test_task_exceeding_context_budget_reports_error_without_calling_model(self):
+        client = Mock()
+        runner = SubtaskRunner(client, "child", [], {}, Mock(), context_token_limit=1000)
+        runner._token_tracker.estimate = lambda messages: sum(len(m["content"]) for m in messages)
+
+        result = json.loads(runner.execute({"tasks": [{"task": "x" * 3000}]}))
+
+        self.assertEqual(result["results"][0]["status"], "error")
+        self.assertIn("超出上下文窗口", result["results"][0]["result"])
+        client.chat.completions.create.assert_not_called()
+
+    def test_empty_task_and_non_string_context_are_rejected(self):
+        runner = SubtaskRunner(Mock(), "child", [], {}, Mock())
+        self.assertTrue(runner.execute({"tasks": [{"task": "  "}]}).startswith("错误："))
+        self.assertTrue(runner.execute({"tasks": [{"task": "valid", "context": 1}]}).startswith("错误："))
+
     def test_child_budget_truncates_tool_output_but_keeps_call_pair(self):
         client = Mock()
         client.chat.completions.create.side_effect = [

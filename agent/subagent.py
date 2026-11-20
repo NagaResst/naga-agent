@@ -76,8 +76,8 @@ class SubtaskRunner:
                 return "错误：每个子任务必须包含 task 字符串。"
             task = item["task"].strip()
             context = item.get("context", "")
-            if not task or len(task) > 2000 or not isinstance(context, str) or len(context) > 2000:
-                return "错误：task 和 context 不能为空或超过 2000 字符。"
+            if not task or not isinstance(context, str):
+                return "错误：task 不能为空，context 必须是字符串。"
             try:
                 result = self._run_task(task, context)
                 results.append({"task": task, "status": "ok", "result": result[:4000]})
