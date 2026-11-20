@@ -757,6 +757,22 @@ class OutputPane:
         self._app.invalidate()
 
 
+def _configure_prompt_layout(prompt_session, output_pane):
+    # Keep the input shrinkable; reserve menu space in the outer layout instead.
+    prompt_session.reserve_space_for_menu = 0
+    layout = prompt_session.app.layout
+    output_window = Window(
+        FormattedTextControl(output_pane.formatted_text, get_cursor_position=output_pane.cursor_position),
+        wrap_lines=True,
+        height=Dimension(weight=1),
+    )
+    layout.container.height = lambda: Dimension(
+        min=3, preferred=8 if prompt_session.default_buffer.complete_state else 3, max=8,
+    )
+    prompt_session.app.layout = Layout(HSplit([output_window, layout.container]), focused_element=layout.current_window)
+    return output_window
+
+
 def main():
     console = Console()
     console.print(Panel("[bold cyan]Naga CLI Agent[/bold cyan]", subtitle="OpenAI 兴容模式对话助手"))
@@ -840,16 +856,9 @@ def main():
         except Exception:
             return ""
 
-    prompt_session = PromptSession(erase_when_done=True, completer=SlashCompleter(agent, config), complete_style=CompleteStyle.COLUMN, reserve_space_for_menu=5)
+    prompt_session = PromptSession(erase_when_done=True, completer=SlashCompleter(agent, config), complete_style=CompleteStyle.COLUMN)
     output_pane = OutputPane(prompt_session.app, show_thinking=agent.config["agent"].get("show_thinking", True))
-    layout = prompt_session.app.layout
-    output_window = Window(
-        FormattedTextControl(output_pane.formatted_text, get_cursor_position=output_pane.cursor_position),
-        wrap_lines=True,
-        height=Dimension(weight=1),
-    )
-    layout.container.height = Dimension(min=3, preferred=3, max=8)
-    prompt_session.app.layout = Layout(HSplit([output_window, layout.container]), focused_element=layout.current_window)
+    output_window = _configure_prompt_layout(prompt_session, output_pane)
     bindings = KeyBindings()
 
     def _scroll_output(lines):

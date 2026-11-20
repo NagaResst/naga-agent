@@ -3,9 +3,18 @@
 import unittest
 from types import SimpleNamespace
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.buffer import CompletionState
+from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
+from prompt_toolkit.input import DummyInput
+from prompt_toolkit.layout.mouse_handlers import MouseHandlers
+from prompt_toolkit.layout.screen import Screen, WritePosition
+from prompt_toolkit.output import DummyOutput
 
 from agent.slash_completer import SlashCompleter
+from main import OutputPane, _configure_prompt_layout
 
 
 def _agent():
@@ -93,6 +102,66 @@ class SlashCompleterTests(unittest.TestCase):
         self.assertEqual(len(completions), 1)
         self.assertEqual(completions[0].text, "/codebase-investigation")
         self.assertEqual(completions[0].display_meta_text, "D" * 40)
+
+
+class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_menu_and_status_fit_and_resize(self):
+        class Output(DummyOutput):
+            rows = 24
+
+            def get_size(self):
+                return Size(rows=self.rows, columns=100)
+
+            def get_rows_below_cursor_position(self):
+                return self.rows
+
+        output = Output()
+        session = PromptSession(
+            message="---\ninput > ", completer=SlashCompleter(_agent(), _CONFIG),
+            bottom_toolbar="STATUS", input=DummyInput(), output=output,
+        )
+        pane = OutputPane(session.app)
+        pane.write("history\n" * 100)
+        _configure_prompt_layout(session, pane)
+
+        def render():
+            screen = Screen()
+            session.app.layout.container.write_to_screen(
+                screen, MouseHandlers(), WritePosition(0, 0, 100, output.rows), "", False, None,
+            )
+            screen.draw_all_floats()
+            return "\n".join(
+                "".join(screen.data_buffer[y][x].char for x in range(100)).rstrip()
+                for y in range(output.rows)
+            )
+
+        with set_app(session.app):
+            idle = render()
+            self.assertNotIn("Window too small", idle)
+            self.assertIn("STATUS", idle)
+            self.assertGreaterEqual(idle.count("history"), 20)
+            session.default_buffer.document = Document("/", 1)
+            completions = list(session.completer.get_completions(session.default_buffer.document, None))
+            session.default_buffer.complete_state = CompletionState(
+                session.default_buffer.document, completions=completions,
+            )
+            rendered = render()
+            self.assertNotIn("Window too small", rendered)
+            self.assertIn("STATUS", rendered)
+            self.assertIn("input > /", rendered)
+            for name in ("/quit", "/exit", "/help", "/confirm", "/thinking"):
+                self.assertIn(name, rendered)
+
+            output.rows = 5
+            rendered = render()
+            self.assertNotIn("Window too small", rendered)
+            self.assertIn("STATUS", rendered)
+            self.assertIn("input > /", rendered)
+
+            output.rows = 24
+            self.assertIn("/thinking", render())
+            session.default_buffer.complete_state = None
+            self.assertGreaterEqual(render().count("history"), 20)
 
 
 if __name__ == "__main__":
