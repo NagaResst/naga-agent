@@ -40,15 +40,15 @@ def execute(args: dict) -> str:
         name = args.get("name", "").strip()
         if not name:
             return f"错误：{action} 动作需要提供 name 参数。"
-        if not _agent.toggle_skill(name, action == "enable"):
+        skill = _agent.toggle_skill(name, action == "enable")
+        if skill is None:
             return f"错误：未找到 skill：{name}"
         if action == "enable":
-            skill = next(skill for skill in _agent._skills if skill["name"] == name)
             return (
-                f"已启用 skill：{name}\n入口文件：{skill['source_file']}\n"
+                f"已启用 skill：{skill['name']}\n入口文件：{skill['source_file']}\n"
                 "本轮若需使用，请先用 read_file 读取入口文件；下一条用户消息起自动匹配。"
             )
-        return f"已停用 skill：{name}"
+        return f"已停用 skill：{skill['name']}"
 
     if action == "reload":
         _agent.reload_skills()

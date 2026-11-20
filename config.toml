@@ -66,7 +66,42 @@ X-Anysearch-Client = "mcp/1.0.0"
 [skills]
 # 激活的 skill 名称列表（对应 skills/*.md 文件的 name 字段）
 # 空列表时，由各文件自身 frontmatter 中的 enabled 字段决定
-enabled = []
+# 从 hermes 迁移的工作相关 skill（2026-11-18）
+enabled = [
+  "ansible-role-authoring",
+  "campaign-infra",
+  "campaign-infra-deploy",
+  "codebase-investigation",
+  "doc-lifecycle",
+  "domain-modeling",
+  "gcs-storage-operations",
+  "git-branch-rework",
+  "github-auth",
+  "grill-with-docs",
+  "infra-budget-calculation",
+  "jira-confluence-query",
+  "local-image-build",
+  "manager-perspective-review",
+  "ncp-platform",
+  "onepoint-platform",
+  "pcms-platform",
+  "poc-test-planning",
+  "pre-merge-impact-review",
+  "process-lifecycle-control",
+  "proxysql-operations",
+  "pulsar-broker-operations",
+  "rakuten-ghe-access",
+  "roc-cli",
+  "sqlpad-api",
+  "sre-agent-platform",
+  "subagent-driven-development",
+  "systematic-debugging",
+  "tidb-lightning-import",
+  "vault-agent-config",
+  "workplace-message-drafts",
+  "wukong-ai-development",
+  "xiaohuamao-api",
+]
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]

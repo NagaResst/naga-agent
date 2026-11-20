@@ -5,14 +5,6 @@ import re
 _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
-_SKILL_TERM_STOPWORDS = {
-    "assistant", "skill", "skills", "agent", "mode", "tool", "tools",
-    "帮助", "助手", "模式", "工具", "能力", "技能", "自动", "执行", "生成",
-    "分析", "报告", "完整", "数据", "信息", "流程", "步骤", "要求", "脚本",
-    "搜索", "联网", "处理", "使用", "支持", "相关", "用户", "任务",
-}
-
-
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """解析 Markdown 文件的 YAML frontmatter。
 
@@ -65,40 +57,6 @@ def _coerce_string_list(value) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     return []
-
-
-def _dedupe_keep_order(items: list[str]) -> list[str]:
-    result = []
-    seen = set()
-    for item in items:
-        if item in seen:
-            continue
-        seen.add(item)
-        result.append(item)
-    return result
-
-
-def _extract_match_terms(text: str) -> list[str]:
-    normalized = _normalize_skill_text(text)
-    terms = []
-
-    for token in re.findall(r'[a-z0-9][a-z0-9+._-]{1,}', normalized):
-        if len(token) >= 3 and token not in _SKILL_TERM_STOPWORDS:
-            terms.append(token)
-
-    for chunk in re.findall(r'[\u4e00-\u9fff]{2,}', normalized):
-        if len(chunk) <= 8 and chunk not in _SKILL_TERM_STOPWORDS:
-            terms.append(chunk)
-        for size in (2, 3, 4):
-            if len(chunk) < size:
-                continue
-            for index in range(len(chunk) - size + 1):
-                term = chunk[index:index + size]
-                if term in _SKILL_TERM_STOPWORDS:
-                    continue
-                terms.append(term)
-
-    return _dedupe_keep_order(terms)
 
 
 def _collect_skill_resource_files(skill_dir: str, primary_file: str) -> list[str]:
@@ -176,18 +134,6 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
         description = meta.get("description", "")
         keywords = _coerce_string_list(meta.get("keywords") or meta.get("tags"))
         examples = _coerce_string_list(meta.get("examples") or meta.get("queries") or meta.get("triggers"))
-        match_phrases = _dedupe_keep_order([
-            _normalize_skill_text(default_name),
-            _normalize_skill_text(name),
-            _normalize_skill_text(description),
-            *[_normalize_skill_text(item) for item in keywords],
-            *[_normalize_skill_text(item) for item in examples],
-        ])
-
-        match_terms = []
-        for phrase in match_phrases:
-            match_terms.extend(_extract_match_terms(phrase))
-        match_terms = _dedupe_keep_order(match_terms)
 
         resource_files = _collect_skill_resource_files(skill_dir, filepath) if skill_dir else []
 
@@ -208,8 +154,6 @@ def discover_skills(skills_dir: str, enabled_names: list) -> list:
             "resource_files": resource_files,
             "keywords": keywords,
             "examples": examples,
-            "match_phrases": [p for p in match_phrases if p],
-            "match_terms": match_terms,
         })
 
     return skills

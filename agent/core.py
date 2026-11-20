@@ -21,7 +21,7 @@ import tools.mcp as mcp_module
 from agent.token_tracker import TokenTracker, input_budget
 from agent.subagent import DELEGATE_TASKS_DEFINITION, SubtaskRunner
 from agent.status import ActivityTracker
-from agent.skill_registry import discover_skills, _extract_match_terms, _normalize_skill_text
+from agent.skill_registry import discover_skills, _normalize_skill_text
 from agent.context_window import get_context_window
 from agent.context_window import (
     get_context_window,
@@ -728,6 +728,14 @@ class Agent:
         ])
         return "\n".join(block_parts)
 
+    def find_skill(self, name: str) -> dict | None:
+        """按规范化名称查找 skill（大小写/标点不敏感），O(n) 单次遍历。"""
+        candidate = _normalize_skill_text(name or "")
+        if not candidate:
+            return None
+        return next((skill for skill in self._skills
+                     if _normalize_skill_text(skill["name"]) == candidate), None)
+
     def _extract_forced_skill_names(self, user_text: str) -> set[str]:
         forced_names = set()
         if not user_text:
@@ -735,21 +743,18 @@ class Agent:
 
         match = re.match(r"^/([^\s/]+)(?:\s|$)", user_text)
         if match:
-            candidate = _normalize_skill_text(match.group(1))
-            for skill in self._skills:
-                if skill["enabled"] and _normalize_skill_text(skill["name"]) == candidate:
-                    forced_names.add(skill["name"])
+            skill = self.find_skill(match.group(1))
+            if skill and skill["enabled"]:
+                forced_names.add(skill["name"])
         return forced_names
 
-    def _score_skill_match(self, skill: dict, signal: str) -> tuple[float, list[str]]:
+    def _score_skill_match(self, skill: dict, signal: str) -> float:
         score = 0.0
-        reasons = []
         matched_phrases = set()
 
         skill_name = _normalize_skill_text(skill.get("name", ""))
         if len(skill_name) >= 2 and skill_name in signal:
             score += 8.0
-            reasons.append(f"name:{skill.get('name', '')}")
             matched_phrases.add(skill_name)
 
         for keyword in skill.get("keywords", []):
@@ -758,9 +763,6 @@ class Agent:
                 continue
             score += 5.0 if len(normalized) >= 4 else 3.5
             matched_phrases.add(normalized)
-            reasons.append(f"keyword:{keyword}")
-            if len(reasons) >= 3:
-                break
 
         for example in skill.get("examples", []):
             normalized = _normalize_skill_text(example)
@@ -768,11 +770,8 @@ class Agent:
                 continue
             score += 4.5
             matched_phrases.add(normalized)
-            reasons.append(f"example:{example[:24]}")
-            if len(reasons) >= 3:
-                break
 
-        return score, reasons
+        return score
 
     def _select_tools(self, last_user_msg: str) -> list:
         """返回内置工具及已配置的 MCP 入口。"""
@@ -802,7 +801,7 @@ class Agent:
         for skill in self._skills:
             if not skill["enabled"]:
                 continue
-            score, _ = self._score_skill_match(skill, signal)
+            score = self._score_skill_match(skill, signal)
             if score >= threshold:
                 candidates.append((score, skill))
         candidates.sort(key=lambda item: (-item[0], item[1]["name"]))
@@ -1802,16 +1801,17 @@ class Agent:
         summary["context"] = getattr(self, "_context_metrics", {})
         return summary
 
-    def toggle_skill(self, name: str, enabled: bool) -> bool:
-        """激活或停用指定 skill，返回是否找到该 skill。"""
-        for skill in self._skills:
-            if skill["name"] == name:
-                skill["enabled"] = enabled
-                self._skill_overrides[name] = enabled
-                # skill 激活状态变化，清零 skill token 缓存，下一轮重新计算
-                self._last_skill_system_tokens = 0
-                return True
-        return False
+    def toggle_skill(self, name: str, enabled: bool) -> dict | None:
+        """激活或停用指定 skill；成功返回该 skill dict，未找到返回 None。"""
+        skill = self.find_skill(name)
+        if skill is None:
+            return None
+        skill["enabled"] = enabled
+        # 用 skill 的规范名作 key，避免用户输入大小写不一致导致 reload 后状态丢失
+        self._skill_overrides[skill["name"]] = enabled
+        # skill 激活状态变化，清零 skill token 缓存，下一轮重新计算
+        self._last_skill_system_tokens = 0
+        return skill
 
     def switch_session(self, new_session_id: str):
         """切换到指定会话：更新 session_id、重置 token 计数和会话主题。"""

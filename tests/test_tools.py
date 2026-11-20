@@ -133,10 +133,12 @@ class ToolTests(unittest.TestCase):
         agent._call_tool.assert_called_once_with("read_file", {"path": "safe.txt"})
 
     def test_skill_command_recognizes_only_exact_leading_name(self):
-        skills = [{"name": "review", "enabled": True}]
-        self.assertIs(_invoked_skill("/review check this", skills), skills[0])
-        self.assertIsNone(_invoked_skill("/reviews check this", skills))
-        self.assertIsNone(_invoked_skill("please /review check this", skills))
+        agent = Mock()
+        agent.find_skill.side_effect = lambda name: {"name": "review", "enabled": True} if name == "review" else None
+        skill = _invoked_skill("/review check this", agent)
+        self.assertEqual(skill["name"], "review")
+        self.assertIsNone(_invoked_skill("/reviews check this", agent))
+        self.assertIsNone(_invoked_skill("please /review check this", agent))
 
     def test_activity_icon_only_updates_bottom_toolbar_cell(self):
         output = Mock()
@@ -510,6 +512,61 @@ class ToolTests(unittest.TestCase):
         finally:
             release.set()
             worker.join(2)
+
+    def test_close_while_busy_cancels_and_waits_for_persistence(self):
+        started = threading.Event()
+        persisted = threading.Event()
+        agent = Mock()
+
+        def chat(text):
+            if text == "first":
+                started.set()
+                agent._cancel_event.wait(2)
+                # 模拟 worker 落库完成
+                persisted.set()
+
+        agent.chat.side_effect = chat
+        runner = ChatRunner(agent, Mock(), Mock(), Mock())
+        try:
+            runner.submit("first", "session")
+            self.assertTrue(started.wait(2))
+            # close() 在 busy 时应取消当前任务并等待 worker 落库
+            runner.close()
+            self.assertTrue(agent._cancel_event.is_set())
+            self.assertTrue(persisted.is_set())
+            # worker 已退出
+            self.assertFalse(runner._worker.is_alive())
+        finally:
+            runner.close()
+
+    def test_close_discards_queued_jobs(self):
+        started = threading.Event()
+        release = threading.Event()
+        agent = Mock()
+
+        def chat(text):
+            if text == "first":
+                started.set()
+                release.wait(2)
+
+        agent.chat.side_effect = chat
+        runner = ChatRunner(agent, Mock(), Mock(), Mock())
+        try:
+            runner.submit("first", "session")
+            runner.submit("second", "session")
+            self.assertTrue(started.wait(2))
+            # close() 应丢弃排队任务并等待当前任务落库
+            close_thread = threading.Thread(target=runner.close, daemon=True)
+            close_thread.start()
+            # close 会取消当前任务，chat 返回后 worker 结束
+            close_thread.join(5)
+            self.assertFalse(close_thread.is_alive())
+            # 排队的 second 不应被执行
+            self.assertNotIn("second", agent.chat.call_args_list and
+                             [c.args[0] for c in agent.chat.call_args_list])
+        finally:
+            release.set()
+            runner.close()
 
     def test_cancel_closes_stream_before_next_queued_job_starts(self):
         started = threading.Event()

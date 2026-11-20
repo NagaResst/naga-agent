@@ -58,18 +58,31 @@ HELP_TEXT = """
   /skill list         显示所有可用 skill 及激活状态
   /skill on <名称>    激活指定 skill
   /skill off <名称>   停用指定 skill
-    /<Skill 名称> <任务> 显式使用已激活的 Skill
+    /<Skill 名称> <任务> 显式使用 Skill（停用的会自动激活）
   /history            显示最近 5 条对话摘要
   /clear              清除当前会话的所有历史消息
   /help               显示此帮助信息
 """
 
 
-def _invoked_skill(user_input: str, skills: list[dict]) -> dict | None:
+def _skill_help_lines(skills: list[dict]) -> list[str]:
+    """生成 /help 中动态 skill 段：可 /name 调用的已激活 skill。"""
+    enabled = [s for s in skills if s.get("enabled")]
+    if not enabled:
+        return []
+    lines = ["", "已激活 Skill（可用 /<名称> <任务> 显式调用）："]
+    for s in enabled:
+        desc = (s.get("description") or "").strip()
+        lines.append(f"  /{s['name']}" + (f"  — {desc[:60]}" if desc else ""))
+    return lines
+
+
+def _invoked_skill(user_input: str, agent) -> dict | None:
+    """识别 /<skill 名> <任务> 形式的显式调用；未命中返回 None。"""
     if not user_input.startswith("/"):
         return None
-    name = user_input[1:].split(maxsplit=1)[0].casefold()
-    return next((skill for skill in skills if skill["name"].casefold() == name), None)
+    name = user_input[1:].split(maxsplit=1)[0]
+    return agent.find_skill(name)
 
 
 def _show_dialogue_header(console: Console, role: str, timestamp=None, elapsed=None):
@@ -218,6 +231,7 @@ class ChatRunner:
         self._agent._insertions = self._insertions
         self._original_input = console.input
         console.input = self._input
+        self._closing = False
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -273,8 +287,31 @@ class ChatRunner:
         return True
 
     def close(self):
+        with self._job_lock:
+            self._closing = True
+        if self.busy:
+            # 中断当前任务：worker 会把已生成的部分回复落库后结束本轮
+            self.cancel_current()
+            # 丢弃排队中的任务（其文本尚未写入会话，退出时不再处理）
+            while True:
+                try:
+                    self._jobs.get_nowait()
+                except queue.Empty:
+                    break
+                self._jobs.task_done()
+            # 等待 worker 完成中断与落库；若 worker 刚取走任务尚未注册取消事件则重试取消
+            deadline = time.monotonic() + 10
+            while self.busy and self._worker.is_alive() and time.monotonic() < deadline:
+                self.cancel_current()
+                self._worker.join(0.1)
+            if self.busy:
+                self._console.print(
+                    "等待任务中断超时，未完成的回复可能未保存。",
+                    style="yellow",
+                )
+                return
         self._jobs.put(None)
-        self._worker.join()
+        self._worker.join(10)
         self._console.input = self._original_input
 
     def answer_confirmation(self, text: str) -> bool:
@@ -312,6 +349,10 @@ class ChatRunner:
                 self._jobs.task_done()
                 return
             text, session_id, rename = job
+            if self._closing:
+                # 退出中：丢弃排队任务（其文本尚未写入会话）
+                self._jobs.task_done()
+                continue
             cancel_event = threading.Event()
             with self._job_lock:
                 self._current_cancel = cancel_event
@@ -334,13 +375,20 @@ class ChatRunner:
                 with self._job_lock:
                     pending = self._insertions.close()
                     for instruction in pending:
-                        self._jobs.put((instruction, session_id, False))
+                        if not self._closing:
+                            self._jobs.put((instruction, session_id, False))
                     self._current_cancel = None
                 if pending:
-                    self._console.print(
-                        f"当前任务已结束或中断，{len(pending)} 条未发送的插入指令已转入队列。",
-                        style="yellow",
-                    )
+                    if self._closing:
+                        self._console.print(
+                            f"程序退出，{len(pending)} 条未发送的插入指令已丢弃。",
+                            style="yellow",
+                        )
+                    else:
+                        self._console.print(
+                            f"当前任务已结束或中断，{len(pending)} 条未发送的插入指令已转入队列。",
+                            style="yellow",
+                        )
                 self._agent.activity.set("idle")
                 self._jobs.task_done()
                 self._prompt_session.app.invalidate()
@@ -909,9 +957,11 @@ def main():
                 ).strip()
         except (KeyboardInterrupt, EOFError):
             console.file = original_console_file
-            console.print("\n[dim]已退出。[/dim]")
-            if not chat_runner.busy:
-                chat_runner.close()
+            console.print("")
+            if chat_runner.busy:
+                console.print("[dim]正在中断当前任务并保存对话记录...[/dim]")
+            chat_runner.close()
+            console.print("[dim]已退出。[/dim]")
             break
 
         if chat_runner.answer_confirmation(user_input):
@@ -920,10 +970,10 @@ def main():
         if not user_input:
             continue
 
-        invoked_skill = _invoked_skill(user_input, agent._skills)
+        invoked_skill = _invoked_skill(user_input, agent)
 
         if chat_runner.busy:
-            if user_input.startswith("/") and not (invoked_skill and invoked_skill["enabled"]):
+            if user_input.startswith("/") and not invoked_skill:
                 console.print("[yellow]正在回复，请等待完成后再执行命令。[/yellow]")
             else:
                 _show_dialogue_message(console, "user", user_input, datetime.now())
@@ -944,7 +994,7 @@ def main():
             break
 
         elif user_input == "/help":
-            console.print(HELP_TEXT)
+            console.print(HELP_TEXT + "\n".join(_skill_help_lines(agent._skills)))
 
         elif user_input == "/confirm on":
             agent.auto_confirm = True
@@ -1138,20 +1188,27 @@ def main():
 
         elif user_input.startswith("/skill on "):
             name = user_input[10:].strip()
-            if agent.toggle_skill(name, True):
-                console.print(f"[green]Skill \'{name}\' 已激活。[/green]")
+            skill = agent.toggle_skill(name, True)
+            if skill:
+                console.print(f"[green]Skill \'{skill['name']}\' 已激活。[/green]")
             else:
                 console.print(f"[red]未找到 skill：{name}，请用 /skill list 查看可用列表。[/red]")
 
         elif user_input.startswith("/skill off "):
             name = user_input[11:].strip()
-            if agent.toggle_skill(name, False):
-                console.print(f"[dim]Skill \'{name}\' 已停用。[/dim]")
+            skill = agent.toggle_skill(name, False)
+            if skill:
+                console.print(f"[dim]Skill \'{skill['name']}\' 已停用。[/dim]")
             else:
                 console.print(f"[red]未找到 skill：{name}，请用 /skill list 查看可用列表。[/red]")
 
         elif user_input.startswith("/") and invoked_skill and not invoked_skill["enabled"]:
-            console.print(f"[yellow]Skill '{invoked_skill['name']}' 已停用；请先用 /skill on {invoked_skill['name']} 启用。[/yellow]")
+            # 显式 /<skill 名> 调用本身即启用意图：自动激活并放行本轮任务
+            agent.toggle_skill(invoked_skill["name"], True)
+            console.print(f"[green]Skill '{invoked_skill['name']}' 已自动激活（原为停用状态）。[/green]")
+            _show_dialogue_message(console, "user", user_input, datetime.now())
+            chat_runner.submit(user_input, agent.session_id, rename=is_new_session)
+            is_new_session = False
 
         elif user_input.startswith("/") and not invoked_skill:
             console.print("[yellow]未知命令，输入 /help 查看可用命令。[/yellow]")
