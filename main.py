@@ -24,10 +24,13 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.utils import get_cwidth
+from prompt_toolkit.shortcuts.prompt import CompleteStyle
+from prompt_toolkit.filters import has_completions
 
 from agent.config import load_config
 from agent.core import Agent, InstructionBuffer, markdown_body
 from agent.status import ActivityTracker
+from agent.slash_completer import SlashCompleter
 from agent.context_window import get_context_window
 from session.sqlite_session import SessionManager
 
@@ -837,7 +840,7 @@ def main():
         except Exception:
             return ""
 
-    prompt_session = PromptSession(erase_when_done=True)
+    prompt_session = PromptSession(erase_when_done=True, completer=SlashCompleter(agent, config), complete_style=CompleteStyle.COLUMN, reserve_space_for_menu=5)
     output_pane = OutputPane(prompt_session.app, show_thinking=agent.config["agent"].get("show_thinking", True))
     layout = prompt_session.app.layout
     output_window = Window(
@@ -845,7 +848,7 @@ def main():
         wrap_lines=True,
         height=Dimension(weight=1),
     )
-    layout.container.height = Dimension(min=3, preferred=3, max=6)
+    layout.container.height = Dimension(min=3, preferred=3, max=8)
     prompt_session.app.layout = Layout(HSplit([output_window, layout.container]), focused_element=layout.current_window)
     bindings = KeyBindings()
 
@@ -865,11 +868,11 @@ def main():
             output_pane.prepend(buffer.getvalue())
             remaining = output_pane.scroll(remaining)
 
-    @bindings.add("up")
+    @bindings.add("up", filter=~has_completions)
     def _scroll_up(event):
         _scroll_output(1)
 
-    @bindings.add("down")
+    @bindings.add("down", filter=~has_completions)
     def _scroll_down(event):
         _scroll_output(-1)
 
