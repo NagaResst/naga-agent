@@ -114,8 +114,8 @@ enabled = [
 
 # ── 记忆系统配置 ────────────────────────────────────────────────────────────
 [memory]
-enabled = false            # false=关闭长期记忆；不影响会话历史和摘要
-backend = "local"          # local=本地 SQLite 文件；qdrant=向量记忆
+enabled = true            # false=关闭长期记忆；不影响会话历史和摘要
+backend = "qdrant"          # local=本地 SQLite 文件；qdrant=向量记忆
 local_path = "naga.db.memory"  # 相对项目根目录；仅 local 模式使用
 agent_id = "naga-agent"  # mem0 情景记忆跨会话共享的归属 ID，修改后旧作用域不可见
 # Layer1 核心记忆
@@ -145,12 +145,3 @@ host = "localhost"
 port = 6333
 embedding_dims = 4096
 collection_name = "mem0_qwen3_embedding_8b"  # 与旧的 768 维 mem0 集合隔离
-
-# ── 本地嵌入 Daemon ─────────────────────────────────────────────────────────
-[embedding_daemon]
-# Daemon 脚本路径（启动时自动 fork 子进程）
-script_path = ""  # 使用远程 Embedding，不启动本地模型下载
-host = "127.0.0.1"
-port = 8000
-# CPU 计算线程数（0 = 自动检测全部核心，默认 PyTorch 只用一半）
-cpu_threads = 0
