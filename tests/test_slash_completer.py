@@ -186,6 +186,9 @@ class PromptLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/thinking", render())
             session.default_buffer.complete_state = None
             self.assertGreaterEqual(render().count("history"), 16)
+            pane.scroll_to_bottom()
+            pane.write("历史会话\n  1. example\n")
+            self.assertIn("example", render())
 
 
 if __name__ == "__main__":

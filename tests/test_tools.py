@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +22,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 
 from agent.core import Agent
 from agent.subagent import SubtaskRunner
+import main as cli
 from main import ChatRunner, DialogueHistoryPager, OutputPane, _invoked_skill, _paint_status_line, _show_dialogue_history
 from session.sqlite_session import SessionManager
 from tools import execute_command, mcp, read_file, skill_manager
@@ -292,6 +293,58 @@ class ToolTests(unittest.TestCase):
         pane.write("new line\n")
         after = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
         self.assertEqual(after, before)
+
+    def test_session_list_is_visible_after_scrolling_history(self):
+        for sessions in (
+            [{"id": "current", "name": "example", "created_at": "2026-01-01T10:00:00", "message_count": 2}],
+            [],
+        ):
+            with self.subTest(sessions=sessions):
+                console = Console(file=StringIO(), width=100, color_system=None)
+                config = {"storage": {"db_path": "unused"}, "model": {"default": "test", "available": []},
+                          "agent": {}}
+                manager = Mock()
+                manager.list_sessions.return_value = sessions
+                agent = Mock()
+                agent.config = config
+                agent.session_id = "current"
+                agent._skills = []
+                agent.find_skill.return_value = None
+                prompt = Mock()
+                runner = Mock()
+                runner.busy = False
+                runner.answer_confirmation.return_value = False
+                runner.take_draft.return_value = None
+                pager = Mock()
+                pager.next_page.return_value = []
+
+                def prompt_input(*args, **kwargs):
+                    pane = console.file
+                    if prompt.prompt.call_count == 1:
+                        pane.write("old 1\nold 2\nold 3\n")
+                        pane.scroll(1)
+                        return "/session list"
+                    visible = fragment_list_to_text(to_formatted_text(pane.formatted_text()))
+                    if sessions:
+                        self.assertIn("历史会话", visible)
+                        self.assertIn("example", visible)
+                        self.assertIn("当前", visible)
+                    else:
+                        self.assertIn("暂无历史会话", visible)
+                    return "/exit"
+
+                prompt.prompt.side_effect = prompt_input
+                with patch.object(cli, "Console", return_value=console), \
+                     patch.object(cli, "load_config", return_value=config), \
+                     patch.object(cli, "SessionManager", return_value=manager), \
+                     patch.object(cli, "select_session", return_value="current"), \
+                     patch.object(cli, "Agent", return_value=agent), \
+                     patch.object(cli, "PromptSession", return_value=prompt), \
+                     patch.object(cli, "_configure_prompt_layout"), \
+                     patch.object(cli, "DialogueHistoryPager", return_value=pager), \
+                     patch.object(cli, "ChatRunner", return_value=runner), \
+                     patch.object(cli, "patch_stdout", return_value=nullcontext()):
+                    cli.main()
 
     def test_output_pane_caches_snapshot_until_content_changes(self):
         pane = OutputPane(Mock())

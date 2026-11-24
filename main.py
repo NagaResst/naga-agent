@@ -741,6 +741,12 @@ class OutputPane:
         self._app.invalidate()
         return remaining
 
+    def scroll_to_bottom(self):
+        with self._lock:
+            self._scrollback = 0
+            self._formatted_cache = None
+        self._app.invalidate()
+
     def clear(self):
         with self._lock:
             self._buffer = _OutputBuffer()
@@ -1133,6 +1139,7 @@ def main():
 
         elif user_input == "/session list":
             sessions = session_manager.list_sessions()[:10]
+            output_pane.scroll_to_bottom()
             if not sessions:
                 console.print("[dim]暂无历史会话。[/dim]")
             else:
